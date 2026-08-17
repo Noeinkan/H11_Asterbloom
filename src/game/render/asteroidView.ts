@@ -21,6 +21,7 @@ import {
   treeVisualScale,
   type Asteroid,
   type FactionId,
+  type ResourceKind,
   type Tree,
   type TreeKind,
   type World,
@@ -41,13 +42,22 @@ import {
   sapStage,
   SAP_WINDOW,
   type FloraPalette,
+  type Hex,
   type ScenePalette,
 } from './palette';
+import { paintSoftRing } from './treeView';
 
 const NO_TREES: Tree[] = [];
 const SUBSTRATE_BINS = 180;
 const POLLEN_CAP = 64;
 const LIFE_ANIM_DT = 1 / 12;
+
+/** Pocket inner-ring color by resource kind. */
+function kindHex(kind: ResourceKind, pal: FloraPalette): Hex {
+  if (kind === 'mineral') return mixHex(pal.stain, pal.rockShadow, 0.3);
+  if (kind === 'water') return mixHex(pal.coreWhite, pal.film, 0.4);
+  return mixHex(pal.core, pal.coreHot, 0.4);
+}
 /**
  * Film inset as a fraction of rock radius — stays near ROCK_SURFACE_INSET.
  * Unused constants from the original film-front model were dropped after the
@@ -68,6 +78,9 @@ export class AsteroidView {
   private film: Graphics;
   private grass: Graphics;
   private grassSap: Graphics;
+  private pocketsGfx: Graphics;
+  private pocketFlashUntil = new Map<number, number>();
+  private pocketLastAmount = new Map<number, number>();
   private pollenGfx: Graphics;
   private halo: Graphics;
   private lastSelected = false;
@@ -129,6 +142,10 @@ export class AsteroidView {
     this.grassSap.eventMode = 'none';
     this.grassSap.blendMode = 'add';
     this.root.addChild(this.grassSap);
+
+    this.pocketsGfx = new Graphics();
+    this.pocketsGfx.eventMode = 'none';
+    this.root.addChild(this.pocketsGfx);
 
     this.pollenGfx = new Graphics();
     this.pollenGfx.eventMode = 'none';
@@ -238,6 +255,78 @@ export class AsteroidView {
     } else {
       this.selectionRing.alpha = 1;
       this.selectionRing.scale.set(1);
+    }
+
+    this.paintPockets(asteroid, t);
+  }
+
+  private paintPockets(asteroid: Asteroid, time: number): void {
+    const g = this.pocketsGfx;
+    g.clear();
+    g.alpha = 1;
+    const pockets = asteroid.pockets;
+    if (pockets.length === 0) return;
+
+    for (const pocket of pockets) {
+      const px = Math.cos(pocket.angle) * pocket.radiusT * asteroid.radius;
+      const py = Math.sin(pocket.angle) * pocket.radiusT * asteroid.radius;
+      const depthA = 0.45 + (1 - pocket.depthT) * 0.4;
+      const pulse = 0.5 + 0.5 * Math.sin(time * 0.9 + pocket.phase);
+      const kColor = kindHex(pocket.kind, this.pal);
+
+      // Feeding flash: brighten briefly when the pocket is actively drained.
+      const last = this.pocketLastAmount.get(pocket.id);
+      if (last !== undefined && last - pocket.amount > 0.001) {
+        this.pocketFlashUntil.set(pocket.id, time + 0.6);
+      }
+      this.pocketLastAmount.set(pocket.id, pocket.amount);
+      const flashUntil = this.pocketFlashUntil.get(pocket.id) ?? 0;
+      const flash = Math.max(0, Math.min(1, (flashUntil - time) / 0.6));
+      if (flashUntil < time) this.pocketFlashUntil.delete(pocket.id);
+
+      paintSoftRing(
+        g,
+        px,
+        py,
+        pocket.amount * 0.7,
+        -1,
+        mixHex(this.pal.rootGlow, kColor, 0.35),
+        (0.1 + 0.06 * pulse) * depthA,
+        5,
+      );
+      paintSoftRing(
+        g,
+        px,
+        py,
+        pocket.amount * 0.45,
+        -1,
+        mixHex(this.pal.rootGlow, kColor, 0.6),
+        (0.16 + 0.08 * pulse) * depthA,
+        4,
+      );
+      paintSoftRing(
+        g,
+        px,
+        py,
+        pocket.amount * 0.18,
+        -1,
+        kColor,
+        (0.32 + 0.12 * pulse + flash * 0.45) * depthA,
+        3,
+      );
+
+      if (flash > 0.001) {
+        paintSoftRing(
+          g,
+          px,
+          py,
+          pocket.amount * 0.85,
+          -1,
+          kColor,
+          0.28 * flash * depthA,
+          3,
+        );
+      }
     }
   }
 
@@ -533,16 +622,39 @@ export class AsteroidView {
     const g = this.film;
     g.clear();
     const n = SUBSTRATE_BINS;
+    // Soft run-edge floor: bins below EDGE_FLOOR are skipped entirely so the
+    // moss doesn't bleed into bare rock. Bins above it are included, but the
+    // per-vertex alpha taper (below) keeps their contribution feathered
+    // instead of as a hard cliff.
+    const EDGE_FLOOR = 0.18;
     const runs: { start: number; len: number }[] = [];
     let i = 0;
     while (i < n) {
-      if (this.substrate[i]! < 0.04) {
+      const c = this.substrate[i]!;
+      if (c < EDGE_FLOOR) {
         i += 1;
         continue;
       }
       const start = i;
-      while (i < n && this.substrate[i]! >= 0.04) i += 1;
+      while (i < n && this.substrate[i]! >= EDGE_FLOOR) i += 1;
       runs.push({ start, len: i - start });
+    }
+    if (
+      runs.length >= 2 &&
+      runs[0]!.start === 0 &&
+      runs[runs.length - 1]!.start + runs[runs.length - 1]!.len === n
+    ) {
+      const last = runs.pop()!;
+      runs[0] = { start: last.start, len: last.len + runs[0]!.len };
+    }
+    // Extend each run by 1 bin on each side so the falloff has room to
+    // feather. The poly loop below clamps the fringe with `fringe`.
+    for (let r = 0; r < runs.length; r++) {
+      const run = runs[r]!;
+      runs[r] = {
+        start: (run.start - 1 + n) % n,
+        len: run.len + 2,
+      };
     }
     if (
       runs.length >= 2 &&

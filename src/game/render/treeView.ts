@@ -634,7 +634,7 @@ function paintSapStroke(
  * use a circle of radius `r`; otherwise the rings are ellipses with axes
  * (r, ry).
  */
-function paintSoftRing(
+export function paintSoftRing(
   g: Graphics,
   x: number,
   y: number,

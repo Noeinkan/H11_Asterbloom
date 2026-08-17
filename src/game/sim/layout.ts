@@ -67,6 +67,7 @@ function tryCoreLayout(seed: number, forceConnected = false): World {
     },
     owner: 'player',
     seed: (seed ^ 0x9e3779b9) >>> 0,
+    role: 'home',
   });
 
   const homeTreeId = allocId(world);
@@ -103,6 +104,7 @@ function tryCoreLayout(seed: number, forceConnected = false): World {
       radius: rockR,
       travelRadius: forceConnected ? 720 : range(rng, 400, 580),
       minerals: mineralsFor(rng, role, rockR),
+      role,
       stats: {
         energy:
           role === 'energy'
@@ -265,6 +267,7 @@ function trySkirmishLayout(seed: number, forceConnected: boolean): World | null 
       radius: radii[i]!,
       travelRadius: travelRadius[i]!,
       minerals: mineralsFor(rng, role, radii[i]!),
+      role,
       stats: {
         energy:
           role === 'energy'

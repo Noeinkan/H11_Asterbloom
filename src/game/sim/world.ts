@@ -1,6 +1,7 @@
 import { generateAsteroidName } from './names';
 import {
   buildAdultTree,
+  coreSeekingStrokes,
   FLOWER_POLLEN_OPEN,
   measureRootFeed,
   rootFeedActive,
@@ -9,7 +10,8 @@ import {
   treeTipsWorld,
 } from './lsystem';
 import { mulberry32, range } from './rng';
-import { crustPolar, pickRockRadius, rockRadiusAt, slotPolar } from './rock';
+import { crustPolar, pickRockRadius, rockRadiusAt, slotAngle, slotPolar } from './rock';
+import { generatePockets } from './pockets';
 import { resolveCombat, seedlingMaxHp } from './combat';
 import {
   DEFENSE_GROWTH_SECONDS,
@@ -27,6 +29,10 @@ import {
   SURFACE_CLEARANCE,
   ROOT_FEED_REGEN,
   ROOT_FEED_SPAWN_BONUS,
+  ROOT_FEED_GROWTH_BONUS,
+  CORE_ENERGY_PER_INTAKE,
+  CORE_FEED_DRAIN,
+  ROOT_INTAKE_FALLOFF,
   SENTINEL_SPAWN_ENERGY,
   SENTINEL_STARVE_DPS,
   SENTINEL_UPKEEP,
@@ -40,6 +46,9 @@ import {
   treeVisualScale,
   type Asteroid,
   type FactionId,
+  type ResourcePocket,
+  type ResourceRole,
+  type RootIntake,
   type Seedling,
   type SeedlingKind,
   type Stats,
@@ -61,6 +70,9 @@ export interface AsteroidSpec {
   seed?: number;
   coreEnergy?: number;
   maxCoreEnergy?: number;
+  /** Rock archetype used to roll pockets when `pockets` is not supplied. */
+  role?: ResourceRole;
+  pockets?: ResourcePocket[];
 }
 
 export function createEmptyWorld(seed = 1): World {
@@ -86,21 +98,27 @@ export function addAsteroid(world: World, spec: AsteroidSpec): Asteroid {
   const id = allocId(world);
   const stats = spec.stats ?? { energy: 50, strength: 50, speed: 50 };
   const minerals = spec.minerals ?? 50;
+  const radius = spec.radius ?? ROCK_RADIUS_DEFAULT;
+  const treeSlots = spec.treeSlots ?? mineralsToSlots(minerals);
+  const seed = spec.seed ?? id;
   const maxEnergyPool = energyCapacity(stats.energy);
+  const pockets = spec.pockets ?? generatePocketsFor(seed, spec.role ?? 'wild', treeSlots);
+  const baseCore = 20 + radius * 0.18;
   const asteroid: Asteroid = {
     id,
     name: spec.name ?? `A${id}`,
     x: spec.x,
     y: spec.y,
-    radius: spec.radius ?? ROCK_RADIUS_DEFAULT,
+    radius,
     travelRadius: spec.travelRadius,
     minerals,
-    treeSlots: spec.treeSlots ?? mineralsToSlots(minerals),
+    treeSlots,
     stats,
     owner: spec.owner ?? 'neutral',
-    seed: spec.seed ?? id,
-    coreEnergy: spec.coreEnergy ?? 100,
-    maxCoreEnergy: spec.maxCoreEnergy ?? 100,
+    seed,
+    pockets,
+    coreEnergy: spec.coreEnergy ?? baseCore,
+    maxCoreEnergy: spec.maxCoreEnergy ?? baseCore,
     energyPool: maxEnergyPool,
     maxEnergyPool,
     shield: 0,
@@ -109,6 +127,20 @@ export function addAsteroid(world: World, spec: AsteroidSpec): Asteroid {
   };
   world.asteroids.set(id, asteroid);
   return asteroid;
+}
+
+/** Slot bearings for a rock, used to keep pockets clear of tree slots. */
+function generatePocketsFor(
+  seed: number,
+  role: ResourceRole,
+  treeSlots: number,
+): ResourcePocket[] {
+  const rng = mulberry32((seed ^ 0x70c0ffee) >>> 0);
+  const angles: number[] = [];
+  for (let i = 0; i < treeSlots; i++) {
+    angles.push(slotAngle(i, treeSlots, seed));
+  }
+  return generatePockets(rng, role, angles);
 }
 
 export function createSandboxWorld(seed = 0xa57eb100): World {
@@ -129,6 +161,7 @@ export function createSandboxWorld(seed = 0xa57eb100): World {
     },
     owner: 'player',
     seed: (seed ^ 0x9e3779b9) >>> 0,
+    role: 'home',
   });
 
   const treeId = allocId(world);
@@ -188,6 +221,92 @@ export function computeTreeCoreFeed(
   const pose = plantPose(asteroid, slotIndex, plantAngle);
   const adult = buildAdultTree(treeSeed, scale, pose.dist, pose.surfaceY, kind);
   return measureRootFeed(adult, pose.dist);
+}
+
+function smoothstep(edge0: number, edge1: number, x: number): number {
+  const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
+  return t * t * (3 - 2 * t);
+}
+
+interface ExtractionResult {
+  total: RootIntake;
+  /** Pocket id → instantaneous extraction rate (resource units/sec). */
+  byPocket: Map<number, number>;
+}
+
+/** World-space positions of one tree's baked adult root tips (static per tree). */
+function computeRootTips(
+  asteroid: Asteroid,
+  treeSeed: number,
+  slotIndex: number,
+  kind: TreeKind,
+  plantAngle?: number,
+): { x: number; y: number }[] {
+  const scale = treeVisualScale(asteroid.radius, asteroid.seed);
+  const pose = plantPose(asteroid, slotIndex, plantAngle);
+  const adult = buildAdultTree(treeSeed, scale, pose.dist, pose.surfaceY, kind);
+
+  const tips: { x: number; y: number }[] = [];
+  const rot = pose.angle + Math.PI / 2;
+  const cos = Math.cos(rot);
+  const sin = Math.sin(rot);
+  for (const stroke of coreSeekingStrokes(adult)) {
+    const tip = stroke.points[stroke.points.length - 1];
+    if (!tip) continue;
+    const dx = tip.x * cos - tip.y * sin;
+    const dy = tip.x * sin + tip.y * cos;
+    tips.push({ x: pose.x - asteroid.x + dx, y: pose.y - asteroid.y + dy });
+  }
+  return tips;
+}
+
+/**
+ * Instantaneous extraction from subsurface pockets given pre-baked root tips.
+ * Cheap: depends only on current pocket amounts, so it is safe to run per tick.
+ */
+function computeExtraction(
+  asteroid: Asteroid,
+  tips: readonly { x: number; y: number }[],
+): ExtractionResult {
+  const total: RootIntake = { mineral: 0, water: 0, energy: 0 };
+  const byPocket = new Map<number, number>();
+  if (asteroid.pockets.length === 0 || tips.length === 0) {
+    return { total, byPocket };
+  }
+
+  const falloff = ROOT_INTAKE_FALLOFF * asteroid.radius;
+  for (const pocket of asteroid.pockets) {
+    if (pocket.amount <= 0) continue;
+    const pr = pocket.radiusT * asteroid.radius;
+    const px = Math.cos(pocket.angle) * pr;
+    const py = Math.sin(pocket.angle) * pr;
+    let rate = 0;
+    for (const tip of tips) {
+      const dx = tip.x - px;
+      const dy = tip.y - py;
+      const d = Math.hypot(dx, dy);
+      rate += (1 - smoothstep(0, falloff, d)) * pocket.amount;
+    }
+    if (rate > 0) {
+      byPocket.set(pocket.id, rate);
+      total[pocket.kind] += rate;
+    }
+  }
+  return { total, byPocket };
+}
+
+/** Aggregated per-kind extraction for a planted tree (for tests + HUD). */
+export function computeRootIntake(
+  asteroid: Asteroid,
+  treeSeed: number,
+  slotIndex: number,
+  kind: TreeKind,
+  plantAngle?: number,
+): RootIntake {
+  return computeExtraction(
+    asteroid,
+    computeRootTips(asteroid, treeSeed, slotIndex, kind, plantAngle),
+  ).total;
 }
 
 /** Spawn interval including root-feed bonus (for tests). */
@@ -806,7 +925,8 @@ function spawnInterval(tree: Tree, asteroid: Asteroid): number {
   const ready = spawnReadiness(tree.maturity, SPAWN_START_MATURITY);
   // Avoid divide-by-zero; callers should not spawn when readiness is 0.
   const maturityMul = Math.max(0.05, ready);
-  const mineralMul = 0.55 + asteroid.minerals / 100;
+  const mineralMul =
+    0.55 + asteroid.minerals / 100 + (tree.rootIntake?.mineral ?? 0) * 0.03;
   const energyMul = 0.75 + asteroid.stats.energy / 280;
   const feedMul = 1 + ROOT_FEED_SPAWN_BONUS * rootFeedActive(tree.maturity, tree.coreFeed);
   return base / (maturityMul * mineralMul * energyMul * feedMul);
@@ -892,16 +1012,95 @@ function tickShields(world: World, dt: number): void {
   }
 }
 
+function tickCoreEnergy(world: World, dt: number): void {
+  const byRock = new Map<
+    number,
+    { intake: RootIntake; treeCount: number; drains: Map<number, number> }
+  >();
+
+  for (const tree of world.trees.values()) {
+    const asteroid = world.asteroids.get(tree.asteroidId);
+    if (!asteroid) continue;
+    if (!tree.rootTips) {
+      tree.rootTips = computeRootTips(
+        asteroid,
+        tree.seed,
+        tree.slotIndex,
+        tree.kind,
+        tree.plantAngle,
+      );
+    }
+    const extraction = computeExtraction(asteroid, tree.rootTips);
+    tree.rootIntake = extraction.total;
+
+    let rec = byRock.get(asteroid.id);
+    if (!rec) {
+      rec = {
+        intake: { mineral: 0, water: 0, energy: 0 },
+        treeCount: 0,
+        drains: new Map(),
+      };
+      byRock.set(asteroid.id, rec);
+    }
+    rec.intake.mineral += extraction.total.mineral;
+    rec.intake.water += extraction.total.water;
+    rec.intake.energy += extraction.total.energy;
+    rec.treeCount += 1;
+    for (const [pid, rate] of extraction.byPocket) {
+      rec.drains.set(pid, (rec.drains.get(pid) ?? 0) + rate);
+    }
+  }
+
+  for (const asteroid of world.asteroids.values()) {
+    const rec = byRock.get(asteroid.id);
+    const drains = rec?.drains ?? new Map<number, number>();
+
+    for (const pocket of asteroid.pockets) {
+      const drain = drains.get(pocket.id) ?? 0;
+      if (drain > 0) {
+        pocket.amount = Math.max(0, pocket.amount - drain * dt);
+        if (pocket.amount <= 0 && pocket.depletedAt === null) {
+          pocket.depletedAt = world.time;
+        }
+      }
+      if (pocket.amount < pocket.maxAmount) {
+        pocket.amount = Math.min(
+          pocket.maxAmount,
+          pocket.amount + pocket.regenPerSec * dt,
+        );
+      }
+      if (pocket.amount > 0) pocket.depletedAt = null;
+    }
+
+    const intake = rec?.intake ?? { mineral: 0, water: 0, energy: 0 };
+    const treeCount = rec?.treeCount ?? 0;
+    asteroid.coreEnergy -= CORE_FEED_DRAIN * treeCount * dt;
+    asteroid.coreEnergy +=
+      (CORE_ENERGY_PER_INTAKE.mineral * intake.mineral +
+        CORE_ENERGY_PER_INTAKE.water * intake.water +
+        CORE_ENERGY_PER_INTAKE.energy * intake.energy) *
+      dt;
+    asteroid.coreEnergy = Math.min(
+      asteroid.maxCoreEnergy,
+      Math.max(0, asteroid.coreEnergy),
+    );
+  }
+}
+
 function tickTrees(world: World, dt: number): void {
   for (const tree of world.trees.values()) {
     const asteroid = world.asteroids.get(tree.asteroidId);
     if (!asteroid) continue;
 
     if (tree.maturity < 1) {
-      tree.maturity = Math.min(
-        1,
-        tree.maturity + dt / growthSeconds(tree.kind),
-      );
+      const base = dt / growthSeconds(tree.kind);
+      const fedBoost =
+        asteroid.coreEnergy > 4
+          ? ROOT_FEED_GROWTH_BONUS *
+            (asteroid.coreEnergy / asteroid.maxCoreEnergy) *
+            dt
+          : 0;
+      tree.maturity = Math.min(1, tree.maturity + base + fedBoost);
     }
 
     if (tree.kind === 'defense') continue;
@@ -1006,6 +1205,7 @@ function tickCapture(world: World, dt: number): void {
 export function tick(world: World, dt: number): void {
   world.time += dt;
   tickEnergy(world, dt);
+  tickCoreEnergy(world, dt);
   tickTrees(world, dt);
   tickShields(world, dt);
 

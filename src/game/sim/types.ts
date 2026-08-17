@@ -14,6 +14,37 @@ export interface Stats {
   speed: number;
 }
 
+export type ResourceKind = 'mineral' | 'water' | 'energy';
+
+/** Rock archetype used by layout to roll pocket counts and amounts. */
+export type ResourceRole = 'home' | 'enemy' | 'energy' | 'wild' | 'empty';
+
+export interface ResourcePocket {
+  id: number;
+  kind: ResourceKind;
+  /** Current resource amount; drains with extraction, regens toward maxAmount. */
+  amount: number;
+  /** Cap amount regens toward. */
+  maxAmount: number;
+  /** Bearing on the disc (radians). */
+  angle: number;
+  /** Radial position as a fraction of rock radius (0 = core, 1 = crust). */
+  radiusT: number;
+  /** Subsurface depth as a fraction of radius; drives transparency. */
+  depthT: number;
+  regenPerSec: number;
+  /** World time the pocket last hit 0 (null while it holds reserves). */
+  depletedAt: number | null;
+  /** Breathing phase offset (radians). */
+  phase: number;
+}
+
+export interface RootIntake {
+  mineral: number;
+  water: number;
+  energy: number;
+}
+
 export interface Asteroid {
   id: number;
   name: string;
@@ -27,9 +58,11 @@ export interface Asteroid {
   stats: Stats;
   owner: FactionId;
   seed: number;
+  /** Subsurface resource pockets feeding root extraction. */
+  pockets: ResourcePocket[];
   /**
-   * Core HP unused: Phase 4 left siege-the-core off.
-   * Capture stays burn-then-plant.
+   * Internal reservoir fed by root extraction from subsurface pockets.
+   * Starts full; drains per tree and refills from per-tree rootIntake.
    */
   coreEnergy: number;
   maxCoreEnergy: number;
@@ -56,6 +89,10 @@ export interface Tree {
   spawnAccumulator: number;
   /** How well inward wood reached the core well (0..1), baked at plant time. */
   coreFeed: number;
+  /** Per-frame extraction from subsurface pockets (cached each tick). */
+  rootIntake?: RootIntake;
+  /** Baked world-space root-tip positions (static per tree, computed once). */
+  rootTips?: { x: number; y: number }[];
 }
 
 export interface Seedling {
@@ -203,6 +240,50 @@ export const ENERGY_REGEN_BASE = 2.4;
 export const ROOT_FEED_SPAWN_BONUS = 0.18;
 /** Extra energy-pool regen per second from one fully fed mature tree. */
 export const ROOT_FEED_REGEN = 0.45;
+
+/** Subsurface resource pockets per rock, by archetype. */
+export const POCKETS_PER_ROCK: Record<ResourceRole, number> = {
+  home: 5,
+  enemy: 4,
+  energy: 6,
+  wild: 2,
+  empty: 1,
+};
+// Enemy mirrors home amounts: a rival home world is just as rich a target.
+export const POCKET_AMOUNT_MINERAL: Record<ResourceRole, number> = {
+  home: 14,
+  enemy: 14,
+  energy: 8,
+  wild: 6,
+  empty: 4,
+};
+export const POCKET_AMOUNT_WATER: Record<ResourceRole, number> = {
+  home: 12,
+  enemy: 12,
+  energy: 6,
+  wild: 4,
+  empty: 6,
+};
+export const POCKET_AMOUNT_ENERGY: Record<ResourceRole, number> = {
+  home: 10,
+  enemy: 10,
+  energy: 18,
+  wild: 3,
+  empty: 2,
+};
+export const POCKET_REGEN_PER_SEC = 0.25;
+/** Falloff (in radiusT units) over which a root tip draws from a pocket. */
+export const ROOT_INTAKE_FALLOFF = 0.85;
+/** Core reservoir drain per tree per second. */
+export const CORE_FEED_DRAIN = 0.04;
+/** Weight of each resource kind when converted into coreEnergy. */
+export const CORE_ENERGY_PER_INTAKE: Record<ResourceKind, number> = {
+  mineral: 1.0,
+  water: 0.7,
+  energy: 1.4,
+};
+/** Modest maturity boost (per second, at full core) when the reservoir is fed. */
+export const ROOT_FEED_GROWTH_BONUS = 0.002;
 export const COMBAT_RANGE = 28;
 export const BASIC_HP = 12;
 export const SENTINEL_HP = 34;

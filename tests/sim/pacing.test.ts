@@ -83,7 +83,7 @@ describe('pacing', () => {
     expect(countOrbitingSeedlings(world, rock.id, 'player')).toBeGreaterThan(0);
   });
 
-  it('does not change coreEnergy while burning undefended trees', () => {
+  it('empties a burning grove without directly damaging the core reservoir', () => {
     const world = createEmptyWorld(202);
     const rock = addAsteroid(world, {
       x: 0,
@@ -92,6 +92,7 @@ describe('pacing', () => {
       owner: 'enemy',
       coreEnergy: 100,
       maxCoreEnergy: 100,
+      pockets: [],
     });
     const treeId = allocId(world);
     world.trees.set(treeId, {
@@ -109,6 +110,12 @@ describe('pacing', () => {
     const before = rock.coreEnergy;
     run(world, TREE_BURN_SECONDS + 1.5);
     expect(world.trees.size).toBe(0);
-    expect(world.asteroids.get(rock.id)!.coreEnergy).toBe(before);
+    // Siege removes trees; the reservoir is only touched by drain/intake
+    // dynamics. With no pockets the only change is the per-tree drain, so
+    // it never exceeds its max or drops below zero.
+    const after = world.asteroids.get(rock.id)!.coreEnergy;
+    expect(after).toBeGreaterThanOrEqual(0);
+    expect(after).toBeLessThanOrEqual(rock.maxCoreEnergy);
+    expect(after).toBeLessThanOrEqual(before);
   });
 });

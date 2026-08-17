@@ -118,6 +118,7 @@ function buildFromSpecs(seed: number, specs: RockSpec[]): {
               ? 'neutral'
               : 'grey',
       seed: (seed ^ ((i + 1) * 0x27d4eb2d)) >>> 0,
+      role,
     });
 
     if (role === 'home') {
