@@ -185,6 +185,14 @@ export function bindGameplay(opts: {
     return camera.screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
   };
 
+  /** Where the gesture happened, as a softened stereo position. */
+  const panFromEvent = (e: PointerEvent) => {
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width <= 0) return 0;
+    const t = (e.clientX - rect.left) / rect.width;
+    return Math.max(-1, Math.min(1, t * 2 - 1)) * 0.7;
+  };
+
   const clearGesture = () => {
     clearHold();
     pointerDown = false;
@@ -360,9 +368,9 @@ export function bindGameplay(opts: {
         const result = sendSeedlings(world, fromId, toId, sendN, 'player');
         onCommand?.(result);
         if (result.ok) {
-          audio.send(sendN);
+          audio.send(sendN, panFromEvent(e));
           onSend?.();
-        } else audio.fail();
+        } else audio.fail(panFromEvent(e));
       }
     }
 

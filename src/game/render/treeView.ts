@@ -29,11 +29,18 @@ import {
   type FloraPalette,
   type ScenePalette,
 } from './palette';
+import { GlowPool, paintGlowEllipse } from './glow';
 import { paintCalyx, paintSeedHull } from './seedlingPaint';
 
 const TREE_REDRAW_INTERVAL = 1 / 15;
 
-function seedlingDepartureSignature(sprouts: readonly Seedling[]): number {
+/**
+ * Hash of the ids of every sprout still attached to a tree. The value is
+ * global, not per-tree, so the caller computes it once per frame and hands
+ * the same number to every view — otherwise each of N trees rescans all M
+ * seedlings and the loop costs O(N·M) for one number.
+ */
+export function seedlingDepartureSignature(sprouts: readonly Seedling[]): number {
   let h = 0;
   for (let i = 0; i < sprouts.length; i++) {
     const s = sprouts[i];
@@ -52,6 +59,14 @@ export class TreeView {
   private rootGfx = new Graphics();
   private rootSap = new Graphics();
   private woodSap = new Graphics();
+  /**
+   * Sap glows live in pooled sprites rather than in the sap `Graphics`. Both
+   * layers are additive and additive blending is commutative, so lifting the
+   * glows out of draw order is free — and it spares the per-frame repaint a
+   * geometry rebuild for every ring it used to stack.
+   */
+  private rootGlow = new GlowPool();
+  private woodGlow = new GlowPool();
   private sapPainted = false;
   private treeId: number;
   private treeSeed: number;
@@ -85,8 +100,14 @@ export class TreeView {
     this.swayPhase = (tree.seed % 1000) * 0.017;
     this.rootSap.blendMode = 'add';
     this.woodSap.blendMode = 'add';
-    this.canopy.addChild(this.wash, this.wood, this.blooms, this.woodSap);
-    this.roots.addChild(this.rootGfx, this.rootSap);
+    this.canopy.addChild(
+      this.wash,
+      this.wood,
+      this.blooms,
+      this.woodSap,
+      this.woodGlow,
+    );
+    this.roots.addChild(this.rootGfx, this.rootSap, this.rootGlow);
     this.layout(tree, asteroid);
     this.redraw(tree, asteroid);
     this.needsRedraw = false;
@@ -170,9 +191,9 @@ export class TreeView {
     sprouts: readonly Seedling[],
     tree: Tree,
     asteroid: Asteroid,
+    signature: number = seedlingDepartureSignature(sprouts),
   ): void {
     if (this.bloomDescriptors.length === 0) return;
-    const signature = seedlingDepartureSignature(sprouts);
     if (signature === this.lastDepartureSignature) return;
     this.lastDepartureSignature = signature;
     const scale = treeVisualScale(asteroid.radius, asteroid.seed);
@@ -470,6 +491,8 @@ export class TreeView {
   private paintSap(tree: Tree, time: number): void {
     const rootSap = this.rootSap;
     const woodSap = this.woodSap;
+    const rootGlow = this.rootGlow;
+    const woodGlow = this.woodGlow;
     const geom = this.grown;
     if (!geom) return;
 
@@ -480,6 +503,11 @@ export class TreeView {
       if (this.sapPainted) {
         rootSap.clear();
         woodSap.clear();
+        // Rewind and close so last frame's sprites stop drawing.
+        rootGlow.begin();
+        rootGlow.end();
+        woodGlow.begin();
+        woodGlow.end();
         this.sapPainted = false;
       }
       return;
@@ -487,6 +515,8 @@ export class TreeView {
 
     rootSap.clear();
     woodSap.clear();
+    rootGlow.begin();
+    woodGlow.begin();
     this.sapPainted = true;
 
     const u = sapRiseU(time, tree.seed);
@@ -505,9 +535,8 @@ export class TreeView {
     if (launch > 0.02) {
       const throb = 1 + core.progress * 0.22;
       const r = wellR * (1.85 + 0.7 * throb) * (0.75 + launch);
-      paintSoftRing(rootSap, 0, this.coreY, r, -1, this.pal.core, 0.16 * launch, 5);
-      paintSoftRing(
-        rootSap,
+      rootGlow.add(0, this.coreY, r, -1, this.pal.core, 0.16 * launch, 5);
+      rootGlow.add(
         0,
         this.coreY,
         wellR * 1.05 * throb,
@@ -516,8 +545,7 @@ export class TreeView {
         0.22 * launch,
         4,
       );
-      paintSoftRing(
-        rootSap,
+      rootGlow.add(
         0,
         this.coreY,
         wellR * 0.48 * throb,
@@ -532,7 +560,7 @@ export class TreeView {
     if (roots.glow > 0.02) {
       for (const r of geom.strokes) {
         if (r.kind !== 'root') continue;
-        paintSapStroke(rootSap, r, roots, strength, this.pal, true);
+        paintSapStroke(rootSap, rootGlow, r, roots, strength, this.pal, true);
       }
     }
 
@@ -540,17 +568,18 @@ export class TreeView {
       const tip = s.points[s.points.length - 1];
       const inward = tip != null && tip.y > geom.surfaceY + 2;
       const layer = inward ? rootSap : woodSap;
+      const glow = inward ? rootGlow : woodGlow;
       if (s.kind === 'wood' && trunk.glow > 0.02) {
-        paintSapStroke(layer, s, trunk, strength, this.pal, false);
+        paintSapStroke(layer, glow, s, trunk, strength, this.pal, false);
         continue;
       }
       // Branches fade as sap leaves the trunk — only a short haze at the join.
       if (s.kind === 'twig' && twig.glow > 0.02) {
-        paintSapStroke(layer, s, twig, strength * 0.22, this.pal, false, 0.28);
+        paintSapStroke(layer, glow, s, twig, strength * 0.22, this.pal, false, 0.28);
         continue;
       }
       if ((s.kind === 'grass' || s.kind === 'tuft') && grass.glow > 0.02) {
-        paintSapStroke(woodSap, s, grass, strength * 0.8, this.pal, false);
+        paintSapStroke(woodSap, woodGlow, s, grass, strength * 0.8, this.pal, false);
       }
     }
 
@@ -561,15 +590,19 @@ export class TreeView {
       for (const f of geom.flowers) {
         const k = ambient * strength;
         const r = f.size * (1.15 + Math.max(trunk.progress, twig.progress) * 0.35);
-        paintSoftRing(woodSap, f.x, f.y, r * 2.1, -1, this.pal.core, 0.12 * k, 5);
-        paintSoftRing(woodSap, f.x, f.y, r * 0.85, -1, this.pal.coreHot, 0.16 * k, 4);
+        woodGlow.add(f.x, f.y, r * 2.1, -1, this.pal.core, 0.12 * k, 5);
+        woodGlow.add(f.x, f.y, r * 0.85, -1, this.pal.coreHot, 0.16 * k, 4);
       }
     }
+
+    rootGlow.end();
+    woodGlow.end();
   }
 }
 
 function paintSapStroke(
   g: Graphics,
+  glow: GlowPool,
   stroke: TreeStroke,
   stage: { progress: number; glow: number; rising: boolean },
   strength: number,
@@ -626,16 +659,19 @@ function paintSapStroke(
     );
   }
   if (taper >= 0.85) {
-    sapHead(g, head.x, head.y, Math.max(w0, w1), stage.glow * strength, pal);
+    sapHead(glow, head.x, head.y, Math.max(w0, w1), stage.glow * strength, pal);
   }
 }
 
 /**
- * Soft-edged glow approximated by stacked concentric shapes of decreasing
- * alpha. Avoids the hard silhouette a single `g.fill({color, alpha})` would
- * leave at low alpha, especially over additive blending. Pass `ry < 0` to
- * use a circle of radius `r`; otherwise the rings are ellipses with axes
- * (r, ry).
+ * Soft-edged glow, now a single gradient ellipse instead of `rings` stacked
+ * fills. Kept as a named export because several callers need the glow *inside*
+ * their own `Graphics` — either the layer is cached and repainted rarely, or
+ * something is drawn over the glow and the order matters. Pass `ry < 0` to use
+ * a circle of radius `r`.
+ *
+ * `rings` costs nothing per call now: it only selects which baked ramp to
+ * sample, and the ramps are shared across the whole scene.
  */
 export function paintSoftRing(
   g: Graphics,
@@ -647,19 +683,7 @@ export function paintSoftRing(
   alpha: number,
   rings: number,
 ): void {
-  if (alpha <= 0.002 || r <= 0.05) return;
-  const n = Math.max(2, rings | 0);
-  const useCircle = ry < 0;
-  for (let i = 0; i < n; i++) {
-    const u = 1 - i / n;
-    const e = u * u;
-    if (useCircle) {
-      g.circle(x, y, r * u);
-    } else {
-      g.ellipse(x, y, r * u, ry * u);
-    }
-    g.fill({ color, alpha: alpha * e });
-  }
+  paintGlowEllipse(g, x, y, r, ry, color, alpha, rings);
 }
 
 function reversePts(pts: { x: number; y: number }[]): { x: number; y: number }[] {
@@ -738,7 +762,7 @@ function sapVein(
 }
 
 function sapHead(
-  g: Graphics,
+  glow: GlowPool,
   x: number,
   y: number,
   width: number,
@@ -747,9 +771,9 @@ function sapHead(
 ): void {
   if (strength <= 0.04) return;
   const r = Math.max(3.8, width * 1.35);
-  paintSoftRing(g, x, y, r * 3.2, -1, pal.core, 0.16 * strength, 5);
-  paintSoftRing(g, x, y, r * 1.85, -1, pal.coreHot, 0.2 * strength, 4);
-  paintSoftRing(g, x, y, r * 0.85, -1, pal.coreWhite, 0.18 * strength, 3);
+  glow.add(x, y, r * 3.2, -1, pal.core, 0.16 * strength, 5);
+  glow.add(x, y, r * 1.85, -1, pal.coreHot, 0.2 * strength, 4);
+  glow.add(x, y, r * 0.85, -1, pal.coreWhite, 0.18 * strength, 3);
 }
 
 function nearPt(

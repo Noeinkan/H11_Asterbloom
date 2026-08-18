@@ -3,10 +3,18 @@ import { mulberry32 } from '../sim/rng';
 import {
   bucketHue,
   hslToHex,
+  mixHex,
   type BackgroundTheme,
   type Hex,
   type ScenePalette,
 } from './palette';
+
+/** Breath offset quantum, in normalized gradient coords. */
+const DRIFT_STEP = 0.01;
+
+function quantize(v: number, step: number): number {
+  return Math.round(v / step) * step;
+}
 
 type Cloud = { x: number; y: number; r: number; mist: boolean; alpha: number };
 type Star = { x: number; y: number; size: number; alpha: number };
@@ -116,16 +124,27 @@ export class Starfield {
   }
 
   /**
-   * Cheap ambient breath: nudge the bloom + vignette centers so the wash
-   * slowly drifts. We mutate cached `FillGradient` instances in place —
-   * the underlying texture is a 1D ramp, so only the placement matrix
-   * changes per frame. No allocation, no re-raster.
+   * Ambient breath: nudge the bloom / vignette centers so the wash slowly
+   * drifts. A built `FillGradient` texture is immutable in Pixi, so the
+   * drift can only reach the screen by rebuilding the gradient and
+   * repainting the backdrop. That is far too expensive per frame, so the
+   * offset is quantized to `DRIFT_STEP`: a 20 s cycle then costs roughly
+   * one rebuild per second, which is all a breath this slow needs.
    */
   tick(t: number): void {
     const slow = t * 0.05; // ≈ 20s per cycle; never distracting
-    const dx = Math.cos(slow) * 0.06;
-    const dy = Math.sin(slow * 0.8) * 0.04;
-    this.gradientCache.driftAll(dx, dy);
+    const dx = quantize(Math.cos(slow) * 0.06, DRIFT_STEP);
+    const dy = quantize(Math.sin(slow * 0.8) * 0.04, DRIFT_STEP);
+    if (!this.gradientCache.setDrift(dx, dy)) return;
+    paintBackdropForTheme(
+      this.backdrop,
+      this.viewW,
+      this.viewH,
+      this.scene,
+      this.themeB,
+      1,
+      this.gradientCache,
+    );
   }
 
   destroy(): void {
@@ -227,12 +246,24 @@ function paintBackdropForTheme(
       break;
   }
 
-  // 4) Vignette: darkened corners.
-  // TEMP DEBUG: omit the vignette while we figure out why the screen is black.
-  // Re-enable once the rest of the gradient layers render.
-  void cache;
-  void w;
-  void h;
+  // 4) Vignette: darkened corners. The center stop is the base color the
+  // layers above already settled on, so the fill is a no-op in the middle
+  // and only bites toward the rim.
+  safeFill(
+    g,
+    cache,
+    `vignette:${theme}`,
+    [
+      { offset: 0, color: base },
+      { offset: 0.55, color: base },
+      { offset: 1, color: mixHex(base, 0x000000, 0.72) },
+    ],
+    'radial',
+    w,
+    h,
+    base,
+    0.55 * alpha,
+  );
 }
 
 /**
@@ -493,78 +524,80 @@ function paintNebulaWash(
   g.fill({ fill: halo, alpha: 0.22 * alpha });
 }
 
-type ColorStop = { offset: number; color: Hex };
+export type ColorStop = { offset: number; color: Hex };
 
 interface CachedGradient {
   grad: FillGradient;
-  /** Default radial center; we restore this every `driftAll` frame. */
-  baseCenter: { x: number; y: number };
-  /** Whether the breath in `tick()` should drift this gradient's center. */
-  driftable: boolean;
+  /**
+   * Signature of everything baked into the gradient's texture: the color
+   * stops plus, for radials, the drifted center. Pixi's `FillGradient`
+   * rasterizes once and then `buildGradient()` short-circuits on
+   * `if (this.texture) return`, so mutating `colorStops` / `center` on a
+   * built instance is silently ignored. The only way to change a gradient
+   * is to throw the old one away and build a new one — which is what this
+   * signature triggers.
+   */
+  sig: string;
 }
 
 /**
  * Reusable `FillGradient` factory. Each `linear(key, ...)` / `radial(key, ...)`
- * returns a stable `FillGradient` instance for that key and rewrites its
- * `colorStops` in place so the GPU texture is reused. Per the Pixi docs,
- * this is cheaper than re-allocating per repaint, and avoids the texture
- * leak that the docs warn about.
+ * returns the cached instance for that key as long as its colors (and drift)
+ * are unchanged; when they move, the cached gradient is destroyed and rebuilt.
+ *
+ * Rebuilding rasterizes a 256px canvas ramp, so callers must keep the churn
+ * slow: the backdrop repaints on the hue-bucket / breath cadence (≈1 Hz), not
+ * per frame.
  */
-class GradientCache {
+export class GradientCache {
   private readonly entries = new Map<string, CachedGradient>();
+  /** Ambient breath offset applied to driftable radial centers. */
+  private driftX = 0;
+  private driftY = 0;
 
   linear(key: string, stops: ColorStop[]): FillGradient {
-    const entry = this.getOrCreate(key, () => ({
-      grad: new FillGradient({
+    const sig = stopsSig(stops);
+    return this.resolve(key, sig, () => {
+      const grad = new FillGradient({
         type: 'linear',
         start: { x: 0, y: 0 },
         end: { x: 0, y: 1 },
         textureSpace: 'local',
-      }),
-      baseCenter: { x: 0.5, y: 0.5 },
-      driftable: false,
-    }));
-    writeStops(entry.grad, stops);
-    return entry.grad;
+      });
+      writeStops(grad, stops);
+      return grad;
+    });
   }
 
   radial(key: string, stops: ColorStop[], driftable = false): FillGradient {
-    const entry = this.getOrCreate(key, () => ({
-      grad: new FillGradient({
+    const cx = driftable ? 0.5 + this.driftX : 0.5;
+    const cy = driftable ? 0.5 + this.driftY : 0.5;
+    const sig = `${stopsSig(stops)}|${cx.toFixed(3)},${cy.toFixed(3)}`;
+    return this.resolve(key, sig, () => {
+      const grad = new FillGradient({
         type: 'radial',
-        center: { x: 0.5, y: 0.5 },
+        center: { x: cx, y: cy },
         innerRadius: 0,
-        outerCenter: { x: 0.5, y: 0.5 },
+        outerCenter: { x: cx, y: cy },
         outerRadius: 0.5,
         textureSpace: 'local',
-      }),
-      baseCenter: { x: 0.5, y: 0.5 },
-      driftable,
-    }));
-    // Refresh the driftable flag if the caller upgraded the entry.
-    entry.driftable = entry.driftable || driftable;
-    writeStops(entry.grad, stops);
-    return entry.grad;
+      });
+      writeStops(grad, stops);
+      return grad;
+    });
   }
 
   /**
-   * Shift the center of every driftable radial gradient by `(dx, dy)`
-   * (in normalized [0..1] coords). Called every frame from
-   * `Starfield.tick` to produce a slow ambient breath.
+   * Set the ambient breath offset (normalized [0..1] coords) used by the
+   * next `radial(..., driftable)` build. Returns true when the offset moved
+   * far enough to be worth a repaint — the caller quantizes, so a 20 s
+   * breath cycle costs a handful of rebuilds, not 1200.
    */
-  driftAll(dx: number, dy: number): void {
-    for (const entry of this.entries.values()) {
-      if (!entry.driftable) continue;
-      const g = entry.grad;
-      g.center = {
-        x: entry.baseCenter.x + dx,
-        y: entry.baseCenter.y + dy,
-      };
-      g.outerCenter = {
-        x: entry.baseCenter.x + dx,
-        y: entry.baseCenter.y + dy,
-      };
-    }
+  setDrift(dx: number, dy: number): boolean {
+    if (dx === this.driftX && dy === this.driftY) return false;
+    this.driftX = dx;
+    this.driftY = dy;
+    return true;
   }
 
   destroy(): void {
@@ -572,13 +605,26 @@ class GradientCache {
     this.entries.clear();
   }
 
-  private getOrCreate(key: string, factory: () => CachedGradient): CachedGradient {
-    let entry = this.entries.get(key);
-    if (entry) return entry;
-    entry = factory();
-    this.entries.set(key, entry);
-    return entry;
+  private resolve(
+    key: string,
+    sig: string,
+    factory: () => FillGradient,
+  ): FillGradient {
+    const entry = this.entries.get(key);
+    if (entry) {
+      if (entry.sig === sig) return entry.grad;
+      entry.grad.destroy();
+    }
+    const grad = factory();
+    this.entries.set(key, { grad, sig });
+    return grad;
   }
+}
+
+export function stopsSig(stops: ColorStop[]): string {
+  let sig = '';
+  for (const s of stops) sig += `${s.offset.toFixed(3)}:${s.color.toString(16)};`;
+  return sig;
 }
 
 function writeStops(grad: FillGradient, stops: ColorStop[]): void {

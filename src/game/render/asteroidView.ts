@@ -497,12 +497,14 @@ export class AsteroidView {
     this.pollenTime = time;
     const rng = this.pollenRng;
 
-    const live = new Set(trees.map((t) => t.id));
-    for (const id of [...this.seededTrees]) {
-      if (!live.has(id)) this.seededTrees.delete(id);
+    // A rock holds a handful of trees, so a linear scan is cheaper than the
+    // Set + two spread copies this used to allocate every frame per rock.
+    // Deleting the current entry mid-iteration is well defined for Map/Set.
+    for (const id of this.seededTrees) {
+      if (!hasTreeId(trees, id)) this.seededTrees.delete(id);
     }
-    for (const id of [...this.bloomCache.keys()]) {
-      if (!live.has(id)) this.bloomCache.delete(id);
+    for (const id of this.bloomCache.keys()) {
+      if (!hasTreeId(trees, id)) this.bloomCache.delete(id);
     }
     if (trees.length === 0) {
       this.pollen.length = 0;
@@ -1190,6 +1192,13 @@ function maxFeed(trees: Tree[]): number {
     best = Math.max(best, rootFeedActive(tree.maturity, tree.coreFeed));
   }
   return best;
+}
+
+function hasTreeId(trees: Tree[], id: number): boolean {
+  for (let i = 0; i < trees.length; i++) {
+    if (trees[i]!.id === id) return true;
+  }
+  return false;
 }
 
 function feedKeyFor(trees: Tree[]): string {

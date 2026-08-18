@@ -48,9 +48,13 @@ import {
   type ScenePalette,
 } from './game/render/palette';
 import { SeedlingLayer } from './game/render/seedlingView';
+import { inView, type ViewBox } from './game/render/viewport';
 import { SendPreview } from './game/render/sendPreview';
 import { Starfield } from './game/render/starfield';
-import { TreeView } from './game/render/treeView';
+import {
+  seedlingDepartureSignature,
+  TreeView,
+} from './game/render/treeView';
 import { tickAi } from './game/sim/ai';
 import {
   CAMPAIGN_MAPS,
@@ -102,6 +106,15 @@ const LOW_RESOLUTION = 1;
 /** Sustained FPS below this (over ~2 s) drops the backbuffer one step. */
 const DEGRADE_FPS = 45;
 const DEGRADE_SAMPLES = 4;
+/**
+ * Sustained FPS above this restores the backbuffer. The gap to `DEGRADE_FPS`
+ * is the hysteresis band: without it a machine sitting right at the budget
+ * would flip resolution every couple of seconds. The sample count is much
+ * higher than `DEGRADE_SAMPLES` on purpose — dropping quality must be quick,
+ * raising it must be sure.
+ */
+const RESTORE_FPS = 58;
+const RESTORE_SAMPLES = 20;
 
 /**
  * Lightweight DOM tooltip that follows the cursor and shows the resource
@@ -164,23 +177,6 @@ function createPocketTooltip(host: HTMLElement): PocketTooltip {
   };
 }
 
-function rockOnScreen(
-  x: number,
-  y: number,
-  radius: number,
-  camX: number,
-  camY: number,
-  zoom: number,
-  viewW: number,
-  viewH: number,
-  pad = 90,
-): boolean {
-  const sx = x * zoom + camX;
-  const sy = y * zoom + camY;
-  const pr = (radius + pad) * zoom;
-  return sx + pr > 0 && sy + pr > 0 && sx - pr < viewW && sy - pr < viewH;
-}
-
 /** `/field.html` skips title / campaign and drops onto a skirmish map. */
 function isFieldBoot(): boolean {
   return document.documentElement.dataset.boot === 'field';
@@ -211,6 +207,8 @@ function freshSeed(): number {
 interface CombatSnap {
   hp: Map<number, number>;
   state: Map<number, SeedlingState>;
+  /** Last known world x, so a death can be panned where it happened. */
+  x: Map<number, number>;
   burn: Map<number, number>;
   trees: Set<number>;
 }
@@ -219,6 +217,7 @@ function emptyCombatSnap(): CombatSnap {
   return {
     hp: new Map(),
     state: new Map(),
+    x: new Map(),
     burn: new Map(),
     trees: new Set(),
   };
@@ -227,11 +226,13 @@ function emptyCombatSnap(): CombatSnap {
 function fillCombatSnap(world: World, snap: CombatSnap): CombatSnap {
   snap.hp.clear();
   snap.state.clear();
+  snap.x.clear();
   snap.burn.clear();
   snap.trees.clear();
   for (const s of world.seedlings.values()) {
     snap.hp.set(s.id, s.hp);
     snap.state.set(s.id, s.state);
+    snap.x.set(s.id, s.x);
   }
   for (const a of world.asteroids.values()) {
     snap.burn.set(a.id, a.burnTimer);
@@ -240,31 +241,40 @@ function fillCombatSnap(world: World, snap: CombatSnap): CombatSnap {
   return snap;
 }
 
+/**
+ * Play the combat effects for one sim step and report whether anything was
+ * actually fighting — the music uses that to decide how hot the match is.
+ * `panAt` turns a world x into a stereo position so hits land on the side of
+ * the field they happened on.
+ */
 function playCombatSfx(
   audio: GameAudio,
   before: CombatSnap,
   world: World,
   into: CombatSnap,
-): CombatSnap {
+  panAt: (worldX: number) => number,
+): { snap: CombatSnap; fighting: boolean } {
   let hpDrop = false;
+  let hitX = 0;
   for (const s of world.seedlings.values()) {
     const prev = before.hp.get(s.id);
     if (prev !== undefined && s.hp < prev - 0.01) {
       hpDrop = true;
+      hitX = s.x;
       break;
     }
   }
-  if (hpDrop) audio.clash();
+  if (hpDrop) audio.clash(panAt(hitX));
 
   for (const [id, st] of before.state) {
     if (world.seedlings.has(id)) continue;
-    if (st !== 'plant') audio.death();
+    if (st !== 'plant') audio.death(panAt(before.x.get(id) ?? 0));
   }
 
   for (const a of world.asteroids.values()) {
     const prevBurn = before.burn.get(a.id) ?? 0;
     if (prevBurn <= 0 && a.burnTimer > 0) {
-      audio.burn();
+      audio.burn(panAt(a.x));
       break;
     }
   }
@@ -289,7 +299,7 @@ function playCombatSfx(
     break;
   }
 
-  return fillCombatSnap(world, into);
+  return { snap: fillCombatSnap(world, into), fighting: hpDrop };
 }
 
 async function loadUiFonts(): Promise<void> {
@@ -318,13 +328,13 @@ async function boot(): Promise<void> {
   applySceneToDocument(scene);
 
   const app = new Application();
-  const dpr = Math.min(window.devicePixelRatio || 1, MAX_RESOLUTION);
+  const maxResolution = Math.min(window.devicePixelRatio || 1, MAX_RESOLUTION);
   await app.init({
     resizeTo: window,
     antialias: true,
     backgroundColor: scene.bg,
     autoDensity: true,
-    resolution: dpr,
+    resolution: maxResolution,
     preference: 'webgl',
     powerPreference: 'high-performance',
   });
@@ -382,6 +392,22 @@ async function boot(): Promise<void> {
   let lastHudKey = '';
   let combatSnap = fillCombatSnap(world, emptyCombatSnap());
   let combatSnapB = emptyCombatSnap();
+  /** Decays over a few seconds after the last exchange; feeds music intensity. */
+  let combatHeat = 0;
+  let audioSyncAcc = 0;
+
+  /**
+   * Screen x → stereo position, softened so nothing is ever hard panned.
+   * Off-screen events fold to the nearest edge rather than wrapping.
+   */
+  const screenPan = (screenX: number): number => {
+    const w = app.screen.width;
+    if (w <= 0) return 0;
+    return Math.max(-1, Math.min(1, (screenX / w) * 2 - 1)) * 0.7;
+  };
+  /** Same, for a point in world space. */
+  const panAt = (worldX: number): number =>
+    screenPan(worldX * camera.zoom + camera.x);
   let lastHueKey = -1;
   let lastPaletteKey = '';
   /** Views whose colors are stale, drained a few per frame while on screen. */
@@ -390,6 +416,7 @@ async function boot(): Promise<void> {
   let fpsSampleStarted = performance.now();
   let fpsSampleFrames = 0;
   let slowSamples = 0;
+  let fastSamples = 0;
   const perf = new PerfProbe();
 
   const canAct = () =>
@@ -443,6 +470,19 @@ async function boot(): Promise<void> {
     followingSend = false;
   };
 
+  /**
+   * True when `treeViews` no longer mirrors `world.trees`. Size alone is not
+   * enough: a tree dying and another being planted in the same tick leaves
+   * the count unchanged while both entries are wrong.
+   */
+  const treeViewsStale = (): boolean => {
+    if (world.trees.size !== treeViews.size) return true;
+    for (const id of treeViews.keys()) {
+      if (!world.trees.has(id)) return true;
+    }
+    return false;
+  };
+
   const syncTrees = () => {
     for (const [id, view] of treeViews) {
       if (world.trees.has(id)) continue;
@@ -467,9 +507,7 @@ async function boot(): Promise<void> {
     abortGameplay = null;
     preview.hide();
     crustMenu?.hide();
-    for (const view of asteroidViews.values()) {
-      view.root.destroy({ children: true });
-    }
+    for (const view of asteroidViews.values()) view.destroy();
     asteroidViews.clear();
     for (const view of treeViews.values()) view.destroy();
     treeViews.clear();
@@ -496,7 +534,9 @@ async function boot(): Promise<void> {
     pauseHud.setSeed(formatSeedHex(sessionSeed));
     writeScene(scene, sceneAtTime(world.seed, 0));
     applySceneToDocument(scene);
-    audio.beginMatch(scene.hue, scene.dark);
+    // Seed the soundtrack from the world seed, so a map's theme is as fixed
+    // as its palette and starfield.
+    audio.beginMatch(scene.hue, scene.dark, world.seed);
     app.renderer.background.color = scene.bg;
     {
       const themes = themeAt(world.seed, palTime);
@@ -508,11 +548,14 @@ async function boot(): Promise<void> {
     for (const a of world.asteroids.values()) {
       const view = new AsteroidView(a, scene);
       view.root.zIndex = 3;
+      // Pollen rides above the canopy but below the seedlings, in its own
+      // container so grains keep drifting over neighbouring geometry.
+      view.pollenRoot.zIndex = 4.5;
       asteroidViews.set(a.id, view);
-      camera.world.addChild(view.root);
+      camera.world.addChild(view.root, view.pollenRoot);
     }
 
-    seedlings = new SeedlingLayer(scene);
+    seedlings = new SeedlingLayer(app.renderer, scene);
     seedlings.back.zIndex = 2.5;
     seedlings.front.zIndex = 5;
     camera.world.addChild(seedlings.back, seedlings.front);
@@ -555,10 +598,10 @@ async function boot(): Promise<void> {
             );
             sessionHud.showCommandResult(result);
             if (result.ok) {
-              audio.plant(gameplay.plantKind);
+              audio.plant(gameplay.plantKind, screenPan(hit.screenX));
               syncTrees();
             } else {
-              audio.fail();
+              audio.fail(screenPan(hit.screenX));
             }
           },
         });
@@ -885,16 +928,30 @@ async function boot(): Promise<void> {
       // more pixels than this GPU can afford. Step the resolution down once
       // — the art is soft-edged, so the loss is barely visible, and every
       // wash and gradient gets proportionally cheaper.
-      const stalling =
-        sessionMode === 'playing' && fps < DEGRADE_FPS && perf.gpuBound();
+      const playing = sessionMode === 'playing';
+      const stalling = playing && fps < DEGRADE_FPS && perf.gpuBound();
       slowSamples = stalling ? slowSamples + 1 : 0;
+      fastSamples = playing && fps >= RESTORE_FPS ? fastSamples + 1 : 0;
       if (slowSamples >= DEGRADE_SAMPLES) {
         slowSamples = 0;
+        fastSamples = 0;
         if (app.renderer.resolution > LOW_RESOLUTION) {
           app.renderer.resize(
             app.screen.width,
             app.screen.height,
             LOW_RESOLUTION,
+          );
+        }
+      } else if (fastSamples >= RESTORE_SAMPLES) {
+        // The degrade used to be permanent: one hitch during worldgen cost
+        // the session its resolution until reload. Climb back once the
+        // frame has been comfortably inside budget for ~10 s.
+        fastSamples = 0;
+        if (app.renderer.resolution < maxResolution) {
+          app.renderer.resize(
+            app.screen.width,
+            app.screen.height,
+            maxResolution,
           );
         }
       }
@@ -915,7 +972,9 @@ async function boot(): Promise<void> {
         tick(world, SIM_DT);
         tickAi(world, SIM_DT);
         tickMatchRuntime(world, matchConfig, matchRuntime, SIM_DT);
-        combatSnap = playCombatSfx(audio, before, world, combatSnapB);
+        const combat = playCombatSfx(audio, before, world, combatSnapB, panAt);
+        combatSnap = combat.snap;
+        if (combat.fighting) combatHeat = 1;
         combatSnapB = before;
         acc -= SIM_DT;
       }
@@ -953,7 +1012,7 @@ async function boot(): Promise<void> {
       return;
     }
 
-    if (world.trees.size !== treeViews.size) syncTrees();
+    if (treeViewsStale()) syncTrees();
 
     const playerOrbit = new Map<number, number>();
     for (const s of world.seedlings.values()) {
@@ -998,34 +1057,48 @@ async function boot(): Promise<void> {
     }
     perf.stop();
 
+    let playerRocks = 0;
     for (const a of world.asteroids.values()) {
+      if (a.owner === 'player') playerRocks += 1;
       const prev = lastOwners.get(a.id);
       if (prev !== a.owner) {
         lastOwners.set(a.id, a.owner);
-        if (a.owner === 'player') audio.capture();
+        if (a.owner === 'player') audio.capture(panAt(a.x));
       }
+    }
+
+    // Feed the soundtrack. A contested field (neither side dominant) plus
+    // recent fighting is what "hot" means here — a runaway win is calm, not
+    // exciting. Twice a second is plenty; the engine ignores small deltas.
+    combatHeat = Math.max(0, combatHeat - frameDt * 0.35);
+    audioSyncAcc += frameDt;
+    if (audioSyncAcc >= 0.5) {
+      audioSyncAcc = 0;
+      const rocks = world.asteroids.size;
+      const share = rocks > 0 ? playerRocks / rocks : 0;
+      const contested = 1 - Math.abs(share * 2 - 1);
+      audio.setIntensity(0.12 + 0.4 * contested + 0.48 * combatHeat);
     }
 
     graphView.sync(world, gameplay.selectedAsteroidId);
 
     const viewW = app.screen.width;
     const viewH = app.screen.height;
+    const viewBox: ViewBox = {
+      camX: camera.x,
+      camY: camera.y,
+      zoom: camera.zoom,
+      w: viewW,
+      h: viewH,
+    };
     perf.start('rocks');
     let rockBudget = ROCK_REPAINTS_PER_FRAME;
     for (const a of world.asteroids.values()) {
       const view = asteroidViews.get(a.id);
       if (!view) continue;
-      const on = rockOnScreen(
-        a.x,
-        a.y,
-        a.radius,
-        camera.x,
-        camera.y,
-        camera.zoom,
-        viewW,
-        viewH,
-      );
+      const on = inView(a.x, a.y, a.radius, viewBox);
       view.root.visible = on;
+      view.pollenRoot.visible = on;
       // Off-screen rocks stay queued: nobody can see their stale colors, and
       // they repaint on the frame they scroll back in.
       if (!on) continue;
@@ -1040,6 +1113,9 @@ async function boot(): Promise<void> {
     perf.stop();
 
     const seedlingsArr = [...world.seedlings.values()];
+    // One hash for the whole field: every tree view compares against the
+    // same number instead of rescanning the seedling array itself.
+    const departureSig = seedlingDepartureSignature(seedlingsArr);
 
     perf.start('trees');
     let treeBudget = TREE_REPAINTS_PER_FRAME;
@@ -1048,16 +1124,7 @@ async function boot(): Promise<void> {
       if (!tree) continue;
       const asteroid = world.asteroids.get(tree.asteroidId);
       if (!asteroid) continue;
-      const on = rockOnScreen(
-        asteroid.x,
-        asteroid.y,
-        asteroid.radius,
-        camera.x,
-        camera.y,
-        camera.zoom,
-        viewW,
-        viewH,
-      );
+      const on = inView(asteroid.x, asteroid.y, asteroid.radius, viewBox);
       view.canopy.visible = on;
       view.roots.visible = on;
       if (!on) continue;
@@ -1066,12 +1133,12 @@ async function boot(): Promise<void> {
         view.retheme(tree, asteroid, scene);
       }
       view.update(tree, asteroid);
-      view.setDepartingSeedlings(seedlingsArr, tree, asteroid);
+      view.setDepartingSeedlings(seedlingsArr, tree, asteroid, departureSig);
     }
     perf.stop();
 
     perf.start('seedlings');
-    seedlings?.sync(world.seedlings);
+    seedlings?.sync(world.seedlings, frameDt, viewBox);
     perf.stop();
 
     if (followingSend) {

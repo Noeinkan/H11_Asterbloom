@@ -1,227 +1,112 @@
 import { describe, expect, it } from 'vitest';
+import { GradientCache, stopsSig, type ColorStop } from '../../src/game/render/starfield';
 
 /**
- * The cache implementation lives inside `src/game/render/starfield.ts`. We
- * only verify the contract here: same key returns the same instance, distinct
- * keys return distinct instances, `destroy()` calls `destroy()` on every
- * cached value, and the entries map is cleared.
+ * These tests drive the real `GradientCache`, not a stand-in. Constructing a
+ * `FillGradient` is cheap and DOM-free — Pixi only rasterizes the ramp onto a
+ * canvas later, inside `buildGradient()`, which the renderer calls. So the
+ * cache's identity / invalidation contract is fully testable in node.
  *
- * The actual `FillGradient` integration is exercised in the browser build,
- * not in unit tests — Pixi's gradient class needs a DOM canvas, which the
- * vitest `node` environment does not provide.
+ * That contract exists because of a sharp edge in Pixi: `buildGradient()`
+ * short-circuits on `if (this.texture) return`. Once a gradient has been
+ * rasterized, writing to `colorStops` or `center` is silently ignored. The
+ * cache must therefore hand back a *new* instance whenever the colors or the
+ * drift move, or the backdrop freezes at whatever palette it first painted.
  */
 
-interface Disposable {
-  destroy(): void;
-}
+const RED: ColorStop[] = [
+  { offset: 0, color: 0xff0000 },
+  { offset: 1, color: 0x000000 },
+];
+const BLUE: ColorStop[] = [
+  { offset: 0, color: 0x0000ff },
+  { offset: 1, color: 0x000000 },
+];
 
-class FakeGradient implements Disposable {
-  destroyed = false;
-  destroyedCount = 0;
-  destroy(): void {
-    this.destroyed = true;
-    this.destroyedCount += 1;
-  }
-}
+describe('stopsSig', () => {
+  it('is stable for equal stops', () => {
+    expect(stopsSig(RED)).toBe(stopsSig([...RED.map((s) => ({ ...s }))]));
+  });
 
-class FakeCache {
-  private readonly entries = new Map<string, FakeGradient>();
+  it('differs when a color changes', () => {
+    expect(stopsSig(RED)).not.toBe(stopsSig(BLUE));
+  });
 
-  get(key: string, factory: () => FakeGradient): FakeGradient {
-    let g = this.entries.get(key);
-    if (g) return g;
-    g = factory();
-    this.entries.set(key, g);
-    return g;
-  }
+  it('differs when an offset changes', () => {
+    const moved: ColorStop[] = [
+      { offset: 0, color: 0xff0000 },
+      { offset: 0.5, color: 0x000000 },
+    ];
+    expect(stopsSig(RED)).not.toBe(stopsSig(moved));
+  });
+});
 
-  destroy(): void {
-    for (const g of this.entries.values()) g.destroy();
-    this.entries.clear();
-  }
-
-  size(): number {
-    return this.entries.size;
-  }
-}
-
-describe('GradientCache contract', () => {
-  it('returns the same instance for the same key', () => {
-    const cache = new FakeCache();
-    const a = cache.get('band:void', () => new FakeGradient());
-    const b = cache.get('band:void', () => new FakeGradient());
+describe('GradientCache', () => {
+  it('reuses the instance while the stops are unchanged', () => {
+    const cache = new GradientCache();
+    const a = cache.linear('band', RED);
+    const b = cache.linear('band', RED);
     expect(a).toBe(b);
-    expect(cache.size()).toBe(1);
-  });
-
-  it('returns distinct instances for distinct keys', () => {
-    const cache = new FakeCache();
-    const a = cache.get('band:void', () => new FakeGradient());
-    const b = cache.get('band:nebula', () => new FakeGradient());
-    expect(a).not.toBe(b);
-    expect(cache.size()).toBe(2);
-  });
-
-  it('only invokes the factory once per key', () => {
-    const cache = new FakeCache();
-    let factories = 0;
-    const make = () => {
-      factories += 1;
-      return new FakeGradient();
-    };
-    cache.get('band:void', make);
-    cache.get('band:void', make);
-    cache.get('band:void', make);
-    expect(factories).toBe(1);
-  });
-
-  it('destroy() destroys every cached value and clears the map', () => {
-    const cache = new FakeCache();
-    const a = cache.get('band:void', () => new FakeGradient());
-    const b = cache.get('band:nebula', () => new FakeGradient());
-    expect(cache.size()).toBe(2);
     cache.destroy();
-    expect(a.destroyed).toBe(true);
-    expect(b.destroyed).toBe(true);
-    expect(cache.size()).toBe(0);
   });
 
-  it('after destroy(), the next get() builds a fresh instance', () => {
-    const cache = new FakeCache();
-    const a = cache.get('band:void', () => new FakeGradient());
-    cache.destroy();
-    const b = cache.get('band:void', () => new FakeGradient());
+  it('rebuilds when the stops change, because a built texture is immutable', () => {
+    const cache = new GradientCache();
+    const a = cache.linear('band', RED);
+    const b = cache.linear('band', BLUE);
     expect(b).not.toBe(a);
-    expect(a.destroyed).toBe(true);
-    expect(b.destroyed).toBe(false);
-  });
-});
-
-/**
- * Sanity check: ensure that the `FillGradient` API is exported from the
- * installed Pixi version. This guards against accidental version drift
- * (e.g. someone downgrades and the symbol disappears).
- */
-describe('Pixi FillGradient export', () => {
-  it('FillGradient is importable from pixi.js', async () => {
-    const mod = await import('pixi.js');
-    expect(typeof mod.FillGradient).toBe('function');
-  });
-});
-
-/**
- * Behavior of the breath / drift system. The cache stores `driftable` per
- * entry; `driftAll(dx, dy)` should only mutate driftable entries and leave
- * the band / non-drifting ones alone. This guarantees the vignette and
- * background bands stay anchored while the blooms breathe.
- */
-describe('driftAll behavior', () => {
-  interface Driftable {
-    center: { x: number; y: number };
-    outerCenter: { x: number; y: number };
-    driftable: boolean;
-    destroyed: boolean;
-    destroy(): void;
-  }
-
-  class FakeDriftable implements Driftable {
-    center = { x: 0.5, y: 0.5 };
-    outerCenter = { x: 0.5, y: 0.5 };
-    driftable = false;
-    destroyed = false;
-    destroy(): void {
-      this.destroyed = true;
-    }
-  }
-
-  interface DriftEntry {
-    grad: FakeDriftable;
-    baseCenter: { x: number; y: number };
-    driftable: boolean;
-  }
-
-  class FakeDriftCache {
-    private readonly entries = new Map<string, DriftEntry>();
-    private factories = 0;
-
-    add(key: string, driftable: boolean): FakeDriftable {
-      const existing = this.entries.get(key);
-      if (existing) {
-        existing.driftable = existing.driftable || driftable;
-        return existing.grad;
-      }
-      this.factories += 1;
-      const grad = new FakeDriftable();
-      grad.driftable = driftable;
-      const entry: DriftEntry = {
-        grad,
-        baseCenter: { x: 0.5, y: 0.5 },
-        driftable,
-      };
-      this.entries.set(key, entry);
-      return grad;
-    }
-
-    factoriesCalled(): number {
-      return this.factories;
-    }
-
-    size(): number {
-      return this.entries.size;
-    }
-
-    driftAll(dx: number, dy: number): void {
-      for (const e of this.entries.values()) {
-        if (!e.driftable) continue;
-        e.grad.center = { x: e.baseCenter.x + dx, y: e.baseCenter.y + dy };
-        e.grad.outerCenter = {
-          x: e.baseCenter.x + dx,
-          y: e.baseCenter.y + dy,
-        };
-      }
-    }
-  }
-
-  it('moves only driftable entries', () => {
-    const cache = new FakeDriftCache();
-    const band = cache.add('band:void', false);
-    const bloom = cache.add('void-bloom', true);
-    const otherBand = cache.add('band:nebula', false);
-    const halo = cache.add('nebula-halo', true);
-
-    cache.driftAll(0.1, -0.05);
-
-    // Drifting entries should move.
-    expect(bloom.center.x).toBeCloseTo(0.6);
-    expect(bloom.center.y).toBeCloseTo(0.45);
-    expect(halo.center.x).toBeCloseTo(0.6);
-    expect(halo.center.y).toBeCloseTo(0.45);
-    // Non-drifting entries should NOT move.
-    expect(band.center.x).toBe(0.5);
-    expect(band.center.y).toBe(0.5);
-    expect(otherBand.center.x).toBe(0.5);
-    expect(otherBand.center.y).toBe(0.5);
+    cache.destroy();
   });
 
-  it('upgrades a cached entry to driftable when requested later', () => {
-    const cache = new FakeDriftCache();
-    cache.add('band:void', false);
-    cache.add('band:void', true); // re-request with driftable=true
-    // Only one entry exists, and it should now be driftable.
-    expect(cache.size()).toBe(1);
-    cache.driftAll(0.2, 0.1);
-    // Find the single entry and check it moved.
-    const entries = [...cache['entries'].values()] as DriftEntry[];
-    expect(entries[0]!.driftable).toBe(true);
-    expect(entries[0]!.grad.center.x).toBeCloseTo(0.7);
-    expect(entries[0]!.grad.center.y).toBeCloseTo(0.6);
+  it('keeps distinct keys on distinct instances', () => {
+    const cache = new GradientCache();
+    const a = cache.radial('bloom', RED);
+    const b = cache.radial('halo', RED);
+    expect(a).not.toBe(b);
+    cache.destroy();
   });
 
-  it('zero offset leaves every center at base', () => {
-    const cache = new FakeDriftCache();
-    const bloom = cache.add('void-bloom', true);
-    cache.driftAll(0, 0);
-    expect(bloom.center.x).toBe(0.5);
-    expect(bloom.center.y).toBe(0.5);
+  it('reuses a radial while neither stops nor drift move', () => {
+    const cache = new GradientCache();
+    const a = cache.radial('bloom', RED, true);
+    const b = cache.radial('bloom', RED, true);
+    expect(a).toBe(b);
+    cache.destroy();
+  });
+
+  it('rebuilds a driftable radial once the breath offset moves', () => {
+    const cache = new GradientCache();
+    const a = cache.radial('bloom', RED, true);
+    expect(cache.setDrift(0.02, -0.01)).toBe(true);
+    const b = cache.radial('bloom', RED, true);
+    expect(b).not.toBe(a);
+    expect(b.center).toEqual({ x: 0.52, y: 0.49 });
+    cache.destroy();
+  });
+
+  it('leaves non-driftable radials anchored when the breath moves', () => {
+    const cache = new GradientCache();
+    const a = cache.radial('band', RED, false);
+    cache.setDrift(0.02, -0.01);
+    const b = cache.radial('band', RED, false);
+    expect(b).toBe(a);
+    expect(b.center).toEqual({ x: 0.5, y: 0.5 });
+    cache.destroy();
+  });
+
+  it('setDrift reports no change for a repeated offset, so no repaint is queued', () => {
+    const cache = new GradientCache();
+    expect(cache.setDrift(0.02, 0)).toBe(true);
+    expect(cache.setDrift(0.02, 0)).toBe(false);
+    cache.destroy();
+  });
+
+  it('destroy() releases every cached gradient and starts fresh', () => {
+    const cache = new GradientCache();
+    const a = cache.linear('band', RED);
+    cache.destroy();
+    const b = cache.linear('band', RED);
+    expect(b).not.toBe(a);
+    cache.destroy();
   });
 });

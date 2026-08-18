@@ -1,72 +1,72 @@
 /**
- * Procedural ambient music + SFX (Web Audio, no samples).
+ * Procedural soundtrack + SFX (Web Audio, no samples).
  *
- * Slow Major7 suspended drone with inharmonic bells, drifting delays, and a
- * synthesized convolution reverb. No melodic lead: the bed is the music.
- * Several harmonically related roots are reachable from a Markov chain; one
- * is picked at random when audio (or a match) starts and glides every minute
- * or so. Inspired by the "non-repeating but never silent" approach used in
- * generative game soundtracks (Eufloria / COCOON / Discreet Music).
+ * The bed is event-based, not a held chord. Six pad voices each re-trigger on
+ * their own loop period, and because those periods share no common multiple
+ * the voicing recombines forever without repeating — the tape-loop trick from
+ * Eno's "Music for Airports". Over that, a short motif generated from the
+ * world seed comes back every half minute or so, each time put through one
+ * motivic variation, so the track has something to recognise without turning
+ * into a jingle. Harmony walks a weighted Markov chain over scale degrees in
+ * a fixed key; the scene hue picks the mode and the key centre, in whole
+ * semitones only.
+ *
+ * All the pitch decisions live in `theory.ts` and all the buffer generation in
+ * `dsp.ts`; this file is the audio graph and the scheduler.
  */
 
+import { mulberry32, pick, range, type Rng } from '../sim/rng';
 import type { TreeKind } from '../sim/types';
+import { makeNoiseChannel, makeReverbTail } from './dsp';
+import {
+  atmosphereForHue,
+  bellGapFor,
+  chordGapFor,
+  chordTones,
+  delayFeedbackFor,
+  ladderSemis,
+  makeMotif,
+  moodMode,
+  nextChord,
+  padCutoffFor,
+  phraseGapFor,
+  PAD_PERIODS,
+  PROGRESSION,
+  rngFromSeed,
+  varyMotif,
+  anchorToChord,
+  type ModeName,
+  type Motif,
+} from './theory';
 
+/** Key centre reference — the tonic sits here before transposition. */
 const A2 = 110;
-const MASTER = 0.32;
-const MUSIC_GAIN = 0.45;
-const SFX_GAIN = 0.85;
 
-/** Roots reachable from the drone (semitones from A2). Pleasantly spaced. */
-const ROOTS = [0, 3, 5, 7, 10, 12, 15, 17, 19];
+const MASTER = 0.42;
+const MUSIC_GAIN = 0.62;
+const SFX_GAIN = 0.8;
 
-/**
- * Voice set relative to the current root (semitones from root).
- * Major7 + sus2/add9 chord: root, 5th, octave, maj7, octave-5th, sus2/add9.
- * Each entry has a steady-state gain (very low — these stack).
- */
-const VOICES: { semis: number; gain: number; type: OscillatorType }[] = [
-  { semis: 0, gain: 0.045, type: 'sine' },
-  { semis: 7, gain: 0.028, type: 'sine' },
-  { semis: 12, gain: 0.034, type: 'triangle' },
-  { semis: 11, gain: 0.022, type: 'sine' },
-  { semis: 19, gain: 0.024, type: 'triangle' },
-  { semis: 14, gain: 0.018, type: 'sine' },
-];
+const REVERB_SECONDS = 4.5;
+const PRE_DELAY_S = 0.028;
 
-/** Inharmonic bell ratios (slightly stretched). */
-const BELLS = [
-  { ratio: 2.04, gain: 0.012, type: 'sine' as OscillatorType },
-  { ratio: 3.07, gain: 0.008, type: 'sine' as OscillatorType },
-  { ratio: 4.11, gain: 0.005, type: 'triangle' as OscillatorType },
-];
-
-/** Drifting delay lengths (seconds). Prime-ish so they don't align. */
+/** Drifting echo lengths (seconds). Prime-ish so they never align. */
 const DELAY_A_BASE = 3.7;
 const DELAY_B_BASE = 5.2;
 
+/** Lookahead scheduler: check often, schedule a little way ahead. */
+const TICK_MS = 40;
+const LOOKAHEAD_S = 0.35;
+
+/** Octave offset per pad voice, paired with a chord tone by index. */
+const PAD_OCTAVES = [-12, 0, 12, 0, 12, 24];
+const PAD_GAINS = [0.055, 0.038, 0.03, 0.026, 0.022, 0.016];
+
+/** Inharmonic modulator ratios — non-integer is what makes a bell a bell. */
+const BELL_RATIOS = [2.61, 3.47, 4.73];
+
 type Mood = 'play' | 'won' | 'lost';
 
-interface VoiceHandle {
-  osc: OscillatorNode;
-  gain: GainNode;
-  baseSemi: number;
-  baseGain: number;
-  /** Optional filter this voice is routed through (for cutoff LFO). */
-  filter?: BiquadFilterNode;
-}
-
-interface BellHandle {
-  osc: OscillatorNode;
-  gain: GainNode;
-  baseFreq: number;
-  baseGain: number;
-}
-
-/**
- * Tiny LFO helper. Creates a slow oscillator, scales it via a gain node, and
- * routes it to an AudioParam. The center value is maintained by `param` itself
- * via setValueAtTime; the LFO adds a small oscillating offset around it.
- */
+/** A slow oscillator added on top of an AudioParam's own value. */
 class LFO {
   osc: OscillatorNode;
   scaler: GainNode;
@@ -97,239 +97,208 @@ class LFO {
   }
 }
 
-function hz(semis: number, ratio: number): number {
-  return A2 * ratio * 2 ** (semis / 12);
-}
-
-function rand(lo: number, hi: number): number {
-  return lo + Math.random() * (hi - lo);
-}
-
-/** Pink-ish noise buffer (2 s), used both for SFX and reverb IR generation. */
-function makeNoise(ctx: AudioContext): AudioBuffer {
-  const length = ctx.sampleRate * 2;
-  const buf = ctx.createBuffer(1, length, ctx.sampleRate);
-  const data = buf.getChannelData(0);
-  let b0 = 0;
-  let b1 = 0;
-  let b2 = 0;
-  for (let i = 0; i < length; i++) {
-    const white = Math.random() * 2 - 1;
-    b0 = 0.99886 * b0 + white * 0.0555179;
-    b1 = 0.99332 * b1 + white * 0.0750759;
-    b2 = 0.969 * b2 + white * 0.153852;
-    data[i] = (b0 + b1 + b2 + white * 0.18) * 0.22;
-  }
-  return buf;
-}
-
-/**
- * Build a reverb impulse response from a noise burst that decays
- * exponentially over ~3 s. Smoothed tail (Hann-ish envelope).
- */
-function makeReverbIR(ctx: AudioContext): AudioBuffer {
-  const length = Math.floor(ctx.sampleRate * 3);
-  const buf = ctx.createBuffer(2, length, ctx.sampleRate);
-  for (let ch = 0; ch < 2; ch++) {
-    const data = buf.getChannelData(ch);
-    for (let i = 0; i < length; i++) {
-      const t = i / length;
-      const env = Math.pow(1 - t, 3.2);
-      data[i] = (Math.random() * 2 - 1) * env;
-    }
-  }
-  return buf;
-}
-
-function makeWarmWave(ctx: AudioContext): PeriodicWave {
-  const real = new Float32Array([0, 1, 0.18, 0.08, 0.03, 0.015]);
-  const imag = new Float32Array(real.length);
-  return ctx.createPeriodicWave(real, imag);
-}
-
 export class GameAudio {
   private ctx: AudioContext | null = null;
+
+  // Output chain.
   private master: GainNode | null = null;
-  private music: GainNode | null = null;
-  private musicDry: GainNode | null = null;
-  private musicWet: GainNode | null = null;
+  private comp: DynamicsCompressorNode | null = null;
+
+  // Music buses.
+  private musicBus: GainNode | null = null;
+  private musicOut: GainNode | null = null;
+  private dryGain: GainNode | null = null;
+  private wetGain: GainNode | null = null;
+  private preDelay: DelayNode | null = null;
+  private reverb: ConvolverNode | null = null;
+  private extraSend: GainNode | null = null;
+
+  private delayA: DelayNode | null = null;
+  private delayB: DelayNode | null = null;
+  private delayAFb: GainNode | null = null;
+  private delayBFb: GainNode | null = null;
+  private delayALfo: LFO | null = null;
+  private delayBLfo: LFO | null = null;
+
+  // Effects buses.
   private sfx: GainNode | null = null;
+  private sfxSend: GainNode | null = null;
+
   private noise: AudioBuffer | null = null;
   private warm: PeriodicWave | null = null;
 
   private enabled = true;
   private unlocked = false;
   private dark = true;
-  /** Multiplier derived from scene hue (semitone transposition of A2). */
-  private ratio = 1;
   private mood: Mood = 'play';
+  private intensity = 0.35;
 
-  /** Active root index (into ROOTS) and applied ratio (transposition). */
-  private rootIdx = 0;
-  private pendingRootIdx: number | null = null;
+  // Musical state.
+  private rng: Rng = mulberry32(0x1234_5678);
+  private mode: ModeName = 'aeolian';
+  private transpose = 0;
+  private chordIdx = 0;
+  private motif: Motif = [];
 
-  private reverb: ConvolverNode | null = null;
-  private delayA: DelayNode | null = null;
-  private delayB: DelayNode | null = null;
-  private delayAFb: GainNode | null = null;
-  private delayBFb: GainNode | null = null;
-  private delayAWet: GainNode | null = null;
-  private delayBWet: GainNode | null = null;
-  private delayALfo: LFO | null = null;
-  private delayBLfo: LFO | null = null;
-
-  private voices: VoiceHandle[] = [];
-  private voiceFilter: BiquadFilterNode | null = null;
-  private voiceLfos: LFO[] = [];
-
-  private bells: BellHandle[] = [];
-  private bellLfos: LFO[] = [];
-  private markovTimer: number | null = null;
+  // Scheduler state (absolute AudioContext times).
+  private schedTimer: number | null = null;
+  private nextPad: number[] = [];
+  private nextBell = 0;
+  private nextPhrase = 0;
+  private nextChordAt = 0;
+  private nextSub = 0;
+  private running = false;
 
   private lastClashAt = 0;
   private lastDeathAt = 0;
   private lastBurnAt = 0;
   private lastCaptureAt = 0;
 
-  private beds: AudioScheduledSourceNode[] = [];
-  private bedsStarting = false;
   private gesturesBound = false;
 
   constructor() {
+    this.rng = rngFromSeed(Math.floor(Math.random() * 0xffff_ffff));
+    this.motif = makeMotif(this.rng);
     this.bindGestures();
-    this.pickRoot();
   }
 
   isEnabled(): boolean {
     return this.enabled;
   }
 
-  setAtmosphere(hue: number, dark: boolean): void {
-    this.dark = dark;
-    // Slight chromatic transpose from hue; same idea as before, gentler range.
-    const semis = ((Math.round((hue / 360) * 12) % 12) - 6) * 0.5;
-    this.ratio = 2 ** (semis / 12);
-    this.applyTranspose();
-    if (this.voiceFilter) {
-      const now = this.ctx?.currentTime ?? 0;
-      this.voiceFilter.frequency.setTargetAtTime(this.dark ? 760 : 1080, now, 1.2);
-    }
-  }
-
-  beginMatch(hue: number, dark: boolean): void {
-    this.mood = 'play';
-    this.pickRoot();
-    this.setAtmosphere(hue, dark);
-    this.scheduleMarkov(8000);
-  }
-
-  private pickRoot(): void {
-    let next = Math.floor(Math.random() * ROOTS.length);
-    if (next === this.rootIdx && ROOTS.length > 1) {
-      next = (next + 1 + Math.floor(Math.random() * (ROOTS.length - 1))) % ROOTS.length;
-    }
-    this.rootIdx = next;
-    this.applyTranspose();
-  }
-
-  private applyTranspose(): void {
-    if (!this.ctx || this.voices.length === 0) return;
-    const now = this.ctx.currentTime;
-    const rootSemi = ROOTS[this.rootIdx] ?? 0;
-    const r = this.ratio;
-    for (const v of this.voices) {
-      const semi = rootSemi + v.baseSemi;
-      v.osc.frequency.setTargetAtTime(hz(semi, r), now, 6);
-    }
-    for (const b of this.bells) {
-      const f = b.baseFreq * 2 ** (rootSemi / 12) * (this.ratio / 1);
-      b.osc.frequency.setTargetAtTime(f, now, 6);
-    }
-  }
+  // ---------------------------------------------------------------- context
 
   private ensure(): AudioContext | null {
     if (!this.enabled) return null;
-    if (!this.ctx) {
-      const AC =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext })
-          .webkitAudioContext;
-      try {
-        this.ctx = new AC({ latencyHint: 'interactive' });
-      } catch {
-        this.ctx = new AC();
-      }
-      this.noise = makeNoise(this.ctx);
-      this.warm = makeWarmWave(this.ctx);
-      this.reverb = this.ctx.createConvolver();
-      this.reverb.buffer = makeReverbIR(this.ctx);
+    if (this.ctx) return this.ctx;
 
-      this.master = this.ctx.createGain();
-      this.master.gain.value = MASTER;
-      this.music = this.ctx.createGain();
-      this.music.gain.value = MUSIC_GAIN;
-      this.musicDry = this.ctx.createGain();
-      this.musicDry.gain.value = 0.65;
-      this.musicWet = this.ctx.createGain();
-      this.musicWet.gain.value = 0.35;
-      this.sfx = this.ctx.createGain();
-      this.sfx.gain.value = SFX_GAIN;
-
-      // Music dry path -> music gain -> master.
-      this.musicDry.connect(this.music);
-      // Music wet path: into reverb (pre-volume) then to music gain.
-      this.music.connect(this.reverb);
-      this.reverb.connect(this.musicWet);
-      this.musicWet.connect(this.master);
-
-      // Two drifting delays on the wet bus. Each delay taps back into itself.
-      this.delayA = this.ctx.createDelay(8);
-      this.delayA.delayTime.value = DELAY_A_BASE;
-      this.delayAFb = this.ctx.createGain();
-      this.delayAFb.gain.value = 0.45;
-      this.delayAWet = this.ctx.createGain();
-      this.delayAWet.gain.value = 0.5;
-
-      this.delayB = this.ctx.createDelay(8);
-      this.delayB.delayTime.value = DELAY_B_BASE;
-      this.delayBFb = this.ctx.createGain();
-      this.delayBFb.gain.value = 0.4;
-      this.delayBWet = this.ctx.createGain();
-      this.delayBWet.gain.value = 0.45;
-
-      this.delayA.connect(this.delayAFb);
-      this.delayAFb.connect(this.delayA);
-      this.delayA.connect(this.delayAWet);
-      this.delayAWet.connect(this.musicWet);
-
-      this.delayB.connect(this.delayBFb);
-      this.delayBFb.connect(this.delayB);
-      this.delayB.connect(this.delayBWet);
-      this.delayBWet.connect(this.musicWet);
-
-      // Drift the delay times slowly (±2%) via LFOs.
-      this.delayALfo = new LFO(this.ctx, 0.018, DELAY_A_BASE * 0.02, this.delayA.delayTime);
-      this.delayBLfo = new LFO(this.ctx, 0.013, DELAY_B_BASE * 0.02, this.delayB.delayTime);
-
-      this.sfx.connect(this.master);
-      this.master.connect(this.ctx.destination);
+    const AC =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext })
+        .webkitAudioContext;
+    let ctx: AudioContext;
+    try {
+      ctx = new AC({ latencyHint: 'interactive' });
+    } catch {
+      ctx = new AC();
     }
-    return this.ctx;
+    this.ctx = ctx;
+
+    const bufRng = mulberry32(0x9e37_79b9);
+    const tail = makeReverbTail(ctx.sampleRate, REVERB_SECONDS, bufRng);
+    const ir = ctx.createBuffer(2, tail[0]!.length, ctx.sampleRate);
+    for (let ch = 0; ch < 2; ch++) ir.copyToChannel(tail[ch]!, ch);
+    this.reverb = ctx.createConvolver();
+    this.reverb.buffer = ir;
+
+    const noiseCh = makeNoiseChannel(ctx.sampleRate, 2, bufRng);
+    this.noise = ctx.createBuffer(1, noiseCh.length, ctx.sampleRate);
+    this.noise.copyToChannel(noiseCh, 0);
+    this.warm = makeWarmWave(ctx);
+
+    // Master: a gentle compressor glues the stacked voices so the whole mix
+    // can sit louder without the pad peaks clipping the effects.
+    this.comp = ctx.createDynamicsCompressor();
+    this.comp.threshold.value = -18;
+    this.comp.knee.value = 20;
+    this.comp.ratio.value = 3;
+    this.comp.attack.value = 0.01;
+    this.comp.release.value = 0.4;
+
+    this.master = ctx.createGain();
+    this.master.gain.value = this.enabled ? MASTER : 0.0001;
+
+    this.musicBus = ctx.createGain();
+    this.musicOut = ctx.createGain();
+    this.musicOut.gain.value = MUSIC_GAIN;
+    this.dryGain = ctx.createGain();
+    this.dryGain.gain.value = 0.62;
+    this.wetGain = ctx.createGain();
+    this.wetGain.gain.value = 0.5;
+    this.preDelay = ctx.createDelay(0.5);
+    this.preDelay.delayTime.value = PRE_DELAY_S;
+    this.extraSend = ctx.createGain();
+    this.extraSend.gain.value = 0.55;
+
+    // Dry path, and a pre-delayed send into the reverb.
+    this.musicBus.connect(this.dryGain);
+    this.dryGain.connect(this.musicOut);
+    this.musicBus.connect(this.preDelay);
+    this.extraSend.connect(this.preDelay);
+    this.preDelay.connect(this.reverb);
+    this.reverb.connect(this.wetGain);
+    this.wetGain.connect(this.musicOut);
+
+    // Two echoes, actually fed this time, each darkening as it repeats.
+    const mkDelay = (base: number, fb: number, wet: number) => {
+      const delay = ctx.createDelay(8);
+      delay.delayTime.value = base;
+      const damp = ctx.createBiquadFilter();
+      damp.type = 'lowpass';
+      damp.frequency.value = 1400;
+      damp.Q.value = 0.4;
+      const feedback = ctx.createGain();
+      feedback.gain.value = fb;
+      const out = ctx.createGain();
+      out.gain.value = wet;
+
+      this.musicBus!.connect(delay);
+      delay.connect(damp);
+      damp.connect(feedback);
+      feedback.connect(delay);
+      damp.connect(out);
+      out.connect(this.musicOut!);
+      return { delay, feedback };
+    };
+    const a = mkDelay(DELAY_A_BASE, 0.42, 0.3);
+    const b = mkDelay(DELAY_B_BASE, 0.36, 0.26);
+    this.delayA = a.delay;
+    this.delayAFb = a.feedback;
+    this.delayB = b.delay;
+    this.delayBFb = b.feedback;
+    this.delayALfo = new LFO(ctx, 0.018, DELAY_A_BASE * 0.02, this.delayA.delayTime);
+    this.delayBLfo = new LFO(ctx, 0.013, DELAY_B_BASE * 0.02, this.delayB.delayTime);
+
+    this.musicOut.connect(this.master);
+
+    // Effects get their own send into the same reverb, so they sound like
+    // they happen in the same room as the music instead of on top of it.
+    this.sfx = ctx.createGain();
+    this.sfx.gain.value = SFX_GAIN;
+    this.sfxSend = ctx.createGain();
+    this.sfxSend.gain.value = 0.3;
+    this.sfx.connect(this.master);
+    this.sfxSend.connect(this.preDelay);
+
+    this.master.connect(this.comp);
+    this.comp.connect(ctx.destination);
+
+    this.applyIntensity(0);
+    return ctx;
   }
 
   private bindGestures(): void {
-    if (this.gesturesBound) return;
+    if (this.gesturesBound || typeof document === 'undefined') return;
     this.gesturesBound = true;
     const kick = () => this.startAmbient();
     document.addEventListener('pointerdown', kick);
     document.addEventListener('keydown', kick);
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) this.startAmbient();
+      if (document.hidden) {
+        // Nothing to listen to on a hidden tab — stop burning cycles.
+        void this.ctx?.suspend().catch(() => {});
+      } else if (this.enabled) {
+        this.startAmbient();
+      }
     });
   }
 
   startAmbient(): void {
     this.whenRunning(() => {});
+  }
+
+  stopAmbient(): void {
+    this.stopScheduler();
   }
 
   private whenRunning(fn: () => void): void {
@@ -339,7 +308,7 @@ export class GameAudio {
     if (!ctx) return;
     const go = () => {
       if (!this.enabled || !this.ctx || this.ctx.state !== 'running') return;
-      void this.startBedsWhenReady();
+      this.startScheduler();
       fn();
     };
     if (ctx.state === 'running') {
@@ -349,241 +318,400 @@ export class GameAudio {
     void ctx.resume().then(go).catch(() => {});
   }
 
-  private async startBedsWhenReady(): Promise<void> {
-    const ctx = this.ctx;
-    if (!ctx || !this.enabled || this.voices.length > 0 || this.bedsStarting) {
+  // -------------------------------------------------------------- lifecycle
+
+  setAtmosphere(hue: number, dark: boolean): void {
+    const atmos = atmosphereForHue(hue, dark);
+    const mode = moodMode(atmos.mode, this.mood);
+    // main.ts calls this on every 1° of hue drift. Bail out unless the
+    // quantised sector actually moved — retuning on every degree is what made
+    // the old bed slide around permanently.
+    if (mode === this.mode && atmos.transpose === this.transpose && dark === this.dark) {
       return;
     }
-    if (ctx.state !== 'running') {
-      try {
-        await ctx.resume();
-      } catch {
-        return;
-      }
+    this.dark = dark;
+    this.mode = mode;
+    this.transpose = atmos.transpose;
+    this.applyIntensity(1.5);
+  }
+
+  beginMatch(hue: number, dark: boolean, seed?: number): void {
+    this.mood = 'play';
+    // Seed the music from the world seed, the way the palette and starfield
+    // are, so a given map always comes with the same theme.
+    this.rng = rngFromSeed(seed ?? Math.floor(Math.random() * 0xffff_ffff));
+    this.motif = makeMotif(this.rng);
+    this.chordIdx = 0;
+    this.dark = !dark; // force setAtmosphere past its early-out
+    this.setAtmosphere(hue, dark);
+    this.resetSchedule();
+  }
+
+  /**
+   * How hot the match is, 0..1. Drives bell density, phrase frequency, pad
+   * brightness and echo length — the music leans in when the field does.
+   */
+  setIntensity(x: number): void {
+    const next = Math.max(0, Math.min(1, x));
+    if (Math.abs(next - this.intensity) < 0.02) return;
+    this.intensity = next;
+    this.applyIntensity(4);
+  }
+
+  private applyIntensity(timeConstant: number): void {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    const fb = delayFeedbackFor(this.intensity);
+    this.delayAFb?.gain.setTargetAtTime(fb, now, Math.max(0.01, timeConstant));
+    this.delayBFb?.gain.setTargetAtTime(
+      fb * 0.85,
+      now,
+      Math.max(0.01, timeConstant),
+    );
+  }
+
+  setEnabled(on: boolean): void {
+    this.enabled = on;
+    if (this.master && this.ctx) {
+      const now = this.ctx.currentTime;
+      this.master.gain.cancelScheduledValues(now);
+      this.master.gain.setValueAtTime(on ? MASTER : 0.0001, now);
     }
-    if (!this.enabled || this.voices.length > 0 || ctx.state !== 'running') {
+    if (!on) {
+      this.stopScheduler();
+      void this.ctx?.suspend().catch(() => {});
       return;
     }
-    this.bedsStarting = true;
-    try {
-      this.startDrone();
-      this.startLfoSource(this.delayALfo);
-      this.startLfoSource(this.delayBLfo);
-      this.scheduleMarkov(12000);
-    } finally {
-      this.bedsStarting = false;
-    }
+    if (this.unlocked) this.startAmbient();
   }
 
-  private startLfoSource(lfo: LFO | null): void {
-    if (!lfo || !this.ctx) return;
-    const now = this.ctx.currentTime + 0.05;
-    lfo.start(now);
-    this.beds.push(lfo.osc);
+  // -------------------------------------------------------------- scheduler
+
+  private startScheduler(): void {
+    if (this.running || !this.ctx) return;
+    this.running = true;
+    this.resetSchedule();
+    this.delayALfo?.start(this.ctx.currentTime + 0.05);
+    this.delayBLfo?.start(this.ctx.currentTime + 0.05);
+    this.schedTimer = window.setInterval(() => this.pump(), TICK_MS);
+    this.pump();
   }
 
-  stopAmbient(): void {
-    this.stopMusicBeds();
+  private stopScheduler(): void {
+    if (this.schedTimer !== null) {
+      window.clearInterval(this.schedTimer);
+      this.schedTimer = null;
+    }
+    this.running = false;
   }
 
-  private stopMusicBeds(): void {
-    if (this.markovTimer !== null) {
-      window.clearTimeout(this.markovTimer);
-      this.markovTimer = null;
-    }
-    for (const src of this.beds) this.stopSrc(src);
-    this.beds = [];
-    for (const v of this.voices) {
-      try {
-        v.osc.stop();
-      } catch {
-        /* already stopped */
-      }
-      try {
-        v.osc.disconnect();
-        v.gain.disconnect();
-        v.filter?.disconnect();
-      } catch {
-        /* already disconnected */
-      }
-    }
-    this.voices = [];
-    this.voiceLfos = [];
-    this.voiceFilter = null;
-    for (const b of this.bells) {
-      try {
-        b.osc.stop();
-      } catch {
-        /* already stopped */
-      }
-      try {
-        b.osc.disconnect();
-        b.gain.disconnect();
-      } catch {
-        /* already disconnected */
-      }
-    }
-    this.bells = [];
-    this.bellLfos = [];
-    for (const lfo of [this.delayALfo, this.delayBLfo]) lfo?.stop();
-    this.delayALfo = null;
-    this.delayBLfo = null;
-    this.bedsStarting = false;
-  }
-
-  private stopSrc(node: AudioScheduledSourceNode | null | undefined): void {
-    if (!node) return;
-    try {
-      node.stop();
-    } catch {
-      /* already stopped */
-    }
-    try {
-      node.disconnect();
-    } catch {
-      /* already disconnected */
-    }
-  }
-
-  private startDrone(): void {
+  private resetSchedule(): void {
     const ctx = this.ctx;
-    const dry = this.musicDry;
-    const wet = this.musicWet;
-    if (!ctx || !dry || !wet) return;
+    if (!ctx) return;
+    const now = ctx.currentTime + 0.1;
+    // Stagger the pad entries so the bed fades up rather than slamming in.
+    this.nextPad = PAD_PERIODS.map((_, i) => now + i * 1.7);
+    this.nextBell = now + range(this.rng, 6, 14);
+    this.nextPhrase = now + range(this.rng, 12, 26);
+    this.nextChordAt = now + chordGapFor(this.rng);
+    this.nextSub = now + 2;
+  }
+
+  /** Lookahead pump: schedule everything that falls inside the next window. */
+  private pump(): void {
+    const ctx = this.ctx;
+    if (!ctx || !this.running || !this.enabled) return;
+    if (ctx.state !== 'running') return;
+    const until = ctx.currentTime + LOOKAHEAD_S;
+
+    while (this.nextChordAt < until) {
+      this.chordIdx = nextChord(this.chordIdx, this.rng);
+      this.nextChordAt += chordGapFor(this.rng);
+    }
+
+    for (let i = 0; i < this.nextPad.length; i++) {
+      while (this.nextPad[i]! < until) {
+        this.padNote(i, this.nextPad[i]!);
+        this.nextPad[i]! += PAD_PERIODS[i]!;
+      }
+    }
+
+    while (this.nextBell < until) {
+      this.bell(this.nextBell);
+      this.nextBell += bellGapFor(this.intensity, this.rng);
+    }
+
+    while (this.nextPhrase < until) {
+      const dur = this.phrase(this.nextPhrase);
+      this.nextPhrase += dur + phraseGapFor(this.intensity, this.rng);
+    }
+
+    while (this.nextSub < until) {
+      this.subSwell(this.nextSub);
+      this.nextSub += range(this.rng, 22, 34);
+    }
+  }
+
+  /** Hz for a semitone offset from the transposed tonic. */
+  private freq(semis: number): number {
+    return A2 * 2 ** ((this.transpose + semis) / 12);
+  }
+
+  private degree(): number {
+    return PROGRESSION[this.chordIdx] ?? 0;
+  }
+
+  // ------------------------------------------------------------------ voices
+
+  /**
+   * One long pad note. Two oscillators a few cents apart give the beating
+   * warmth; the panner drifts across the note so the bed is wide.
+   */
+  private padNote(voice: number, when: number): void {
+    const ctx = this.ctx;
+    const bus = this.musicBus;
+    if (!ctx || !bus) return;
+
+    const tones = chordTones(this.mode, this.degree(), 4);
+    const semis = tones[voice % tones.length]! + (PAD_OCTAVES[voice] ?? 0);
+    const f = this.freq(semis);
+    const peak = PAD_GAINS[voice] ?? 0.02;
+
+    const attack = range(this.rng, 3.5, 5);
+    const hold = range(this.rng, 5, 9);
+    const release = range(this.rng, 5, 8);
+    const end = when + attack + hold + release;
 
     const filter = ctx.createBiquadFilter();
     filter.type = 'lowpass';
     filter.Q.value = 0.5;
-    filter.frequency.value = this.dark ? 760 : 1080;
-    this.voiceFilter = filter;
+    filter.frequency.value = padCutoffFor(this.intensity, this.dark);
 
-    const now = ctx.currentTime;
-    const rootSemi = ROOTS[this.rootIdx] ?? 0;
-    const r = this.ratio;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, when);
+    g.gain.linearRampToValueAtTime(peak, when + attack);
+    g.gain.setValueAtTime(peak, when + attack + hold);
+    g.gain.linearRampToValueAtTime(0.0001, end);
 
-    // Voices: major7 + sus2/add9 stack, each with its own LFO on detune/amp.
-    const GOLDEN = Math.PI * (3 - Math.sqrt(5));
-    for (let i = 0; i < VOICES.length; i++) {
-      const def = VOICES[i]!;
+    const panner = ctx.createStereoPanner();
+    const side = voice % 2 === 0 ? -1 : 1;
+    const p0 = side * range(this.rng, 0.15, 0.5);
+    panner.pan.setValueAtTime(p0, when);
+    panner.pan.linearRampToValueAtTime(p0 * range(this.rng, 0.3, 0.9), end);
+
+    const oscs: OscillatorNode[] = [];
+    for (const cents of [-1, 1]) {
       const osc = ctx.createOscillator();
-      osc.type = def.type;
-      osc.frequency.value = hz(rootSemi + def.semis, r);
-      // Per-voice detune (±3 to ±14 cents) for "beating" warmth.
-      const cents = rand(3, 14) * (Math.random() < 0.5 ? -1 : 1);
-      osc.detune.value = cents;
-
-      const g = ctx.createGain();
-      g.gain.setValueAtTime(0.0001, now);
-      g.gain.linearRampToValueAtTime(def.gain, now + 4);
-
+      osc.type = voice < 2 ? 'sine' : 'triangle';
+      osc.frequency.value = f;
+      osc.detune.value = cents * range(this.rng, 5, 9);
       osc.connect(g);
-      g.connect(filter);
-
-      osc.start(now);
-      this.beds.push(osc);
-
-      // Per-voice slow LFO on amplitude (~0.005–0.02 Hz, golden-angle spread).
-      const ampFreq = 0.005 + (i * GOLDEN) % 0.018;
-      const ampDepth = def.gain * 0.22;
-      const ampLfo = new LFO(ctx, ampFreq, ampDepth, g.gain);
-      ampLfo.start(now);
-      this.voiceLfos.push(ampLfo);
-      this.beds.push(ampLfo.osc);
-
-      this.voices.push({ osc, gain: g, baseSemi: def.semis, baseGain: def.gain });
+      osc.start(when);
+      osc.stop(end + 0.05);
+      oscs.push(osc);
     }
 
-    filter.connect(dry);
-    filter.connect(wet);
+    g.connect(filter);
+    filter.connect(panner);
+    panner.connect(bus);
 
-    // Inharmonic bells — sparse "sparkles", gated by Markov.
-    for (let i = 0; i < BELLS.length; i++) {
-      const def = BELLS[i]!;
-      const osc = ctx.createOscillator();
-      osc.type = def.type;
-      const baseFreq = hz(rootSemi + 12, r) * def.ratio * 0.5;
-      osc.frequency.value = baseFreq;
-      const g = ctx.createGain();
-      // Start silent — Markov gate fades them in.
-      g.gain.setValueAtTime(0.0001, now);
-      osc.connect(g);
-      g.connect(wet);
-      osc.start(now);
-      this.bells.push({ osc, gain: g, baseFreq, baseGain: def.gain });
-      this.beds.push(osc);
+    oscs[0]!.addEventListener(
+      'ended',
+      () => {
+        for (const o of oscs) safeDisconnect(o);
+        safeDisconnect(g);
+        safeDisconnect(filter);
+        safeDisconnect(panner);
+      },
+      { once: true },
+    );
+  }
 
-      // Per-bell slow LFO on amplitude.
-      const lfo = new LFO(ctx, 0.04 + i * 0.011, def.gain * 0.8, g.gain);
-      lfo.start(now);
-      this.bellLfos.push(lfo);
-      this.beds.push(lfo.osc);
+  /**
+   * FM strike. The modulator dies in a moment while the carrier rings on —
+   * that gap between the two envelopes is the whole difference between a bell
+   * and a sine tone.
+   */
+  private fmStrike(opts: {
+    when: number;
+    freq: number;
+    ratio: number;
+    index: number;
+    modDecay: number;
+    decay: number;
+    gain: number;
+    pan: number;
+    send: number;
+  }): void {
+    const ctx = this.ctx;
+    const bus = this.musicBus;
+    if (!ctx || !bus) return;
+    const { when } = opts;
+    const end = when + opts.decay;
+
+    const carrier = ctx.createOscillator();
+    carrier.type = 'sine';
+    carrier.frequency.value = opts.freq;
+
+    const mod = ctx.createOscillator();
+    mod.type = 'sine';
+    mod.frequency.value = opts.freq * opts.ratio;
+    const modGain = ctx.createGain();
+    modGain.gain.setValueAtTime(opts.freq * opts.index, when);
+    modGain.gain.exponentialRampToValueAtTime(1, when + opts.modDecay);
+    mod.connect(modGain);
+    modGain.connect(carrier.frequency);
+
+    const amp = ctx.createGain();
+    amp.gain.setValueAtTime(0.0001, when);
+    amp.gain.exponentialRampToValueAtTime(opts.gain, when + 0.008);
+    amp.gain.exponentialRampToValueAtTime(0.0001, end);
+
+    const panner = ctx.createStereoPanner();
+    panner.pan.value = opts.pan;
+
+    carrier.connect(amp);
+    amp.connect(panner);
+    panner.connect(bus);
+    if (this.extraSend && opts.send > 0) {
+      const send = ctx.createGain();
+      send.gain.value = opts.send;
+      panner.connect(send);
+      send.connect(this.extraSend);
+      carrier.addEventListener('ended', () => safeDisconnect(send), { once: true });
     }
+
+    mod.start(when);
+    mod.stop(end + 0.02);
+    carrier.start(when);
+    carrier.stop(end + 0.02);
+    carrier.addEventListener(
+      'ended',
+      () => {
+        safeDisconnect(carrier);
+        safeDisconnect(mod);
+        safeDisconnect(modGain);
+        safeDisconnect(amp);
+        safeDisconnect(panner);
+      },
+      { once: true },
+    );
   }
 
-  /** Markov-style gate: each tick decides which bells to fade in/out. */
-  private scheduleMarkov(waitMs?: number): void {
-    if (this.markovTimer !== null) window.clearTimeout(this.markovTimer);
-    this.markovTimer = window.setTimeout(() => {
-      this.markovStep();
-      const next = rand(45000, 90000);
-      this.scheduleMarkov(next);
-    }, waitMs ?? 60000);
+  /** A sparse struck bell on a chord tone, two octaves up. */
+  private bell(when: number): void {
+    const step = anchorToChord(
+      Math.floor(range(this.rng, 0, 8)),
+      this.mode,
+      this.degree(),
+    );
+    this.fmStrike({
+      when,
+      freq: this.freq(ladderSemis(this.mode, step) + 24),
+      ratio: pick(this.rng, BELL_RATIOS),
+      index: range(this.rng, 2.5, 6),
+      modDecay: range(this.rng, 0.1, 0.2),
+      decay: range(this.rng, 2.5, 4),
+      gain: range(this.rng, 0.03, 0.055),
+      pan: range(this.rng, -0.6, 0.6),
+      send: 0.7,
+    });
   }
 
-  private markovStep(): void {
-    if (!this.ctx || !this.musicDry) return;
+  /**
+   * Restate the theme. One variation operator per outing (and now and then
+   * the plain theme), so it stays the same tune without ever repeating.
+   * Returns the phrase length in seconds.
+   */
+  private phrase(when: number): number {
+    const notes =
+      this.rng() < 0.2 ? this.motif.map((n) => ({ ...n })) : varyMotif(this.motif, this.rng);
+    if (notes.length === 0) return 1;
+
+    const beat = range(this.rng, 0.55, 0.85);
+    const degree = this.degree();
+    const pan = range(this.rng, -0.3, 0.3);
+    let t = when;
+
+    for (let i = 0; i < notes.length; i++) {
+      const note = notes[i]!;
+      // Ground the phrase by pulling its outer notes onto the chord.
+      const step =
+        i === 0 || i === notes.length - 1
+          ? anchorToChord(note.step, this.mode, degree)
+          : note.step;
+      const dur = note.dur * beat;
+      this.fmStrike({
+        when: t,
+        freq: this.freq(ladderSemis(this.mode, step) + 12),
+        ratio: 2.01,
+        index: range(this.rng, 1.2, 2.4),
+        modDecay: range(this.rng, 0.06, 0.12),
+        decay: Math.max(1.2, dur * 2.4),
+        gain: range(this.rng, 0.055, 0.08),
+        pan: pan + range(this.rng, -0.12, 0.12),
+        send: 0.85,
+      });
+      t += dur;
+    }
+    return t - when;
+  }
+
+  /** Low swell under everything — the old mix had no weight below the pad. */
+  private subSwell(when: number): void {
+    const ctx = this.ctx;
+    const bus = this.musicBus;
+    if (!ctx || !bus) return;
+    const attack = range(this.rng, 7, 11);
+    const release = range(this.rng, 10, 16);
+    const end = when + attack + release;
+
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.value = this.freq(chordTones(this.mode, this.degree(), 1)[0]! - 24);
+
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 120;
+    filter.Q.value = 0.4;
+
+    const g = ctx.createGain();
+    const peak = 0.05 + this.intensity * 0.03;
+    g.gain.setValueAtTime(0.0001, when);
+    g.gain.linearRampToValueAtTime(peak, when + attack);
+    g.gain.linearRampToValueAtTime(0.0001, end);
+
+    osc.connect(filter);
+    filter.connect(g);
+    g.connect(bus);
+    osc.start(when);
+    osc.stop(end + 0.05);
+    osc.addEventListener(
+      'ended',
+      () => {
+        safeDisconnect(osc);
+        safeDisconnect(filter);
+        safeDisconnect(g);
+      },
+      { once: true },
+    );
+  }
+
+  // ------------------------------------------------------------------ mixing
+
+  /** Pull the music back for a moment so an effect can land. */
+  private duck(amount = 0.55, recover = 0.8): void {
+    if (!this.musicOut || !this.ctx) return;
     const now = this.ctx.currentTime;
-
-    // 60% chance to glide to a new root (must differ).
-    if (Math.random() < 0.6) {
-      let next = Math.floor(Math.random() * ROOTS.length);
-      if (next === this.rootIdx && ROOTS.length > 1) {
-        next = (next + 1 + Math.floor(Math.random() * Math.max(1, ROOTS.length - 1))) % ROOTS.length;
-      }
-      this.pendingRootIdx = next;
-    }
-    // Apply glide.
-    const targetIdx = this.pendingRootIdx ?? this.rootIdx;
-    if (targetIdx !== this.rootIdx) {
-      const prev = this.rootIdx;
-      this.rootIdx = targetIdx;
-      this.pendingRootIdx = null;
-      const r = this.ratio;
-      const newRoot = ROOTS[this.rootIdx] ?? 0;
-      const oldRoot = ROOTS[prev] ?? 0;
-      for (const v of this.voices) {
-        v.osc.frequency.cancelScheduledValues(now);
-        v.osc.frequency.setValueAtTime(hz(oldRoot + v.baseSemi, r), now);
-        v.osc.frequency.setTargetAtTime(hz(newRoot + v.baseSemi, r), now + 0.5, 6);
-      }
-      for (const b of this.bells) {
-        const oldF = b.baseFreq * 2 ** (oldRoot / 12);
-        const newF = b.baseFreq * 2 ** (newRoot / 12);
-        b.osc.frequency.cancelScheduledValues(now);
-        b.osc.frequency.setValueAtTime(oldF, now);
-        b.osc.frequency.setTargetAtTime(newF, now + 0.5, 6);
-      }
-    }
-
-    // Bell gate: each bell fades toward its base gain or zero with prob.
-    for (let i = 0; i < this.bells.length; i++) {
-      const b = this.bells[i]!;
-      const want = Math.random() < 0.5 ? b.baseGain : 0;
-      b.gain.gain.cancelScheduledValues(now);
-      b.gain.gain.setValueAtTime(b.gain.gain.value, now);
-      b.gain.gain.linearRampToValueAtTime(Math.max(0.0001, want), now + 8);
-    }
-  }
-
-  private duck(amount = 0.42, recover = 0.85): void {
-    if (!this.music || !this.ctx) return;
-    const now = this.ctx.currentTime;
-    const g = this.music.gain;
+    const g = this.musicOut.gain;
     g.cancelScheduledValues(now);
     g.setValueAtTime(g.value, now);
     g.linearRampToValueAtTime(MUSIC_GAIN * amount, now + 0.05);
     g.linearRampToValueAtTime(MUSIC_GAIN, now + recover);
   }
+
+  // -------------------------------------------------------------------- SFX
 
   private tone(opts: {
     freq: number;
@@ -596,10 +724,10 @@ export class GameAudio {
     detune?: number;
     pan?: number;
     filterFreq?: number;
-    dest?: AudioNode;
+    send?: number;
   }): void {
     const ctx = this.ctx;
-    const dest = opts.dest ?? this.sfx;
+    const dest = this.sfx;
     if (!ctx || !dest) return;
     const now = ctx.currentTime + (opts.delay ?? 0);
     const osc = ctx.createOscillator();
@@ -628,26 +756,26 @@ export class GameAudio {
     const amp = opts.gain ?? 0.08;
     const attack = Math.min(opts.attack ?? 0.012, opts.dur * 0.4);
     g.gain.setValueAtTime(0.0001, now);
-    if (attack > 0.08) {
-      g.gain.linearRampToValueAtTime(amp, now + attack);
-    } else {
-      g.gain.exponentialRampToValueAtTime(amp, now + Math.max(0.008, attack));
-    }
+    if (attack > 0.08) g.gain.linearRampToValueAtTime(amp, now + attack);
+    else g.gain.exponentialRampToValueAtTime(amp, now + Math.max(0.008, attack));
     g.gain.exponentialRampToValueAtTime(0.0001, now + opts.dur);
 
-    if (opts.pan !== undefined && opts.pan !== 0) {
-      const p = ctx.createStereoPanner();
-      p.pan.value = opts.pan;
-      node.connect(g);
-      g.connect(p);
-      p.connect(dest);
-    } else {
-      node.connect(g);
-      g.connect(dest);
+    const p = ctx.createStereoPanner();
+    p.pan.value = clampPan(opts.pan ?? 0);
+    node.connect(g);
+    g.connect(p);
+    p.connect(dest);
+    if (this.sfxSend && (opts.send ?? 0) > 0) {
+      const send = ctx.createGain();
+      send.gain.value = opts.send!;
+      p.connect(send);
+      send.connect(this.sfxSend);
+      osc.addEventListener('ended', () => safeDisconnect(send), { once: true });
     }
 
     osc.start(now);
     osc.stop(now + opts.dur + 0.02);
+    osc.addEventListener('ended', () => safeDisconnect(p), { once: true });
   }
 
   private noiseBurst(opts: {
@@ -659,6 +787,7 @@ export class GameAudio {
     q?: number;
     delay?: number;
     pan?: number;
+    send?: number;
   }): void {
     const ctx = this.ctx;
     if (!ctx || !this.sfx || !this.noise) return;
@@ -676,66 +805,79 @@ export class GameAudio {
     g.gain.setValueAtTime(0.0001, now);
     g.gain.exponentialRampToValueAtTime(opts.gain, now + 0.012);
     g.gain.exponentialRampToValueAtTime(0.0001, now + opts.dur);
+    const p = ctx.createStereoPanner();
+    p.pan.value = clampPan(opts.pan ?? 0);
     src.connect(f);
     f.connect(g);
-    if (opts.pan) {
-      const p = ctx.createStereoPanner();
-      p.pan.value = opts.pan;
-      g.connect(p);
-      p.connect(this.sfx);
-    } else {
-      g.connect(this.sfx);
+    g.connect(p);
+    p.connect(this.sfx);
+    if (this.sfxSend && (opts.send ?? 0) > 0) {
+      const send = ctx.createGain();
+      send.gain.value = opts.send!;
+      p.connect(send);
+      send.connect(this.sfxSend);
+      src.addEventListener('ended', () => safeDisconnect(send), { once: true });
     }
     src.start(now, Math.random() * 1.4);
     src.stop(now + opts.dur + 0.02);
+    src.addEventListener(
+      'ended',
+      () => {
+        safeDisconnect(src);
+        safeDisconnect(f);
+        safeDisconnect(g);
+        safeDisconnect(p);
+      },
+      { once: true },
+    );
   }
 
-  plant(kind: TreeKind = 'dyson'): void {
-    this.whenRunning(() => this.plantNow(kind));
+  plant(kind: TreeKind = 'dyson', pan = 0): void {
+    this.whenRunning(() => this.plantNow(kind, pan));
   }
 
-  private plantNow(kind: TreeKind): void {
-    const shift = kind === 'energy' ? 4 : kind === 'defense' ? -3 : 0;
-    const notes = [12, 19, 24].map((s) => hz(s + shift, this.ratio));
-    for (let i = 0; i < notes.length; i++) {
+  private plantNow(kind: TreeKind, pan: number): void {
+    // Plant on chord tones so it lands inside the current harmony.
+    const shift = kind === 'energy' ? 1 : kind === 'defense' ? -1 : 0;
+    const tones = chordTones(this.mode, this.degree(), 3);
+    for (let i = 0; i < tones.length; i++) {
       this.tone({
-        freq: notes[i]!,
-        dur: 0.5,
+        freq: this.freq(tones[i]! + 12 + shift * 12),
+        dur: 0.6,
         type: 'sine',
         gain: 0.07,
         attack: 0.018,
         delay: i * 0.06,
-      });
-      this.tone({
-        freq: notes[i]! * 2,
-        dur: 0.28,
-        type: 'triangle',
-        gain: 0.016,
-        delay: i * 0.06,
+        pan,
+        send: 0.4,
       });
     }
     this.noiseBurst({
-      dur: 0.08,
+      dur: 0.09,
       gain: 0.035,
       filterType: 'lowpass',
       filterFreq: 900,
       q: 0.6,
+      pan,
+      send: 0.25,
     });
   }
 
-  send(count = 1): void {
-    this.whenRunning(() => this.sendNow(count));
+  send(count = 1, pan = 0): void {
+    this.whenRunning(() => this.sendNow(count, pan));
   }
 
-  private sendNow(count: number): void {
+  private sendNow(count: number, pan: number): void {
     const intensity = Math.min(1.1, 0.5 + Math.log2(1 + count) * 0.16);
     this.noiseBurst({
-      dur: 0.22,
+      dur: 0.24,
       gain: 0.06 * intensity,
       filterType: 'bandpass',
       filterFreq: 380,
       filterTo: 1800,
       q: 1.0,
+      pan,
+      send: 0.3,
     });
     this.tone({
       freq: 320,
@@ -744,176 +886,208 @@ export class GameAudio {
       type: 'sine',
       gain: 0.04 * intensity,
       attack: 0.012,
+      pan,
+      send: 0.25,
     });
   }
 
-  capture(): void {
+  capture(pan = 0): void {
     this.whenRunning(() => {
       const t = performance.now();
       if (t - this.lastCaptureAt < 250) return;
       this.lastCaptureAt = t;
-      this.captureNow();
+      this.captureNow(pan);
     });
   }
 
-  private captureNow(): void {
-    const notes = [12, 19, 24, 28];
-    for (let i = 0; i < notes.length; i++) {
+  private captureNow(pan: number): void {
+    // An arpeggio up the current chord — a capture should sound like the
+    // music agreeing with you, not like a separate beep.
+    const tones = chordTones(this.mode, this.degree(), 4);
+    for (let i = 0; i < tones.length; i++) {
       this.tone({
-        freq: hz(notes[i]!, this.ratio),
-        dur: 0.7,
+        freq: this.freq(tones[i]! + 12),
+        dur: 0.8,
         type: 'sine',
-        gain: 0.07,
+        gain: 0.065,
         attack: 0.025,
         delay: i * 0.08,
+        pan,
+        send: 0.6,
       });
     }
-    for (const s of [0, 4, 7, 12]) {
-      this.tone({
-        freq: hz(s, this.ratio),
-        dur: 1.4,
-        type: 'warm',
-        gain: 0.035,
-        attack: 0.12,
-      });
-    }
+    this.tone({
+      freq: this.freq(tones[0]!),
+      dur: 1.6,
+      type: 'warm',
+      gain: 0.035,
+      attack: 0.14,
+      pan: pan * 0.5,
+      send: 0.5,
+    });
   }
 
-  clash(): void {
+  clash(pan = 0): void {
     this.whenRunning(() => {
       const t = performance.now();
       if (t - this.lastClashAt < 180) return;
       this.lastClashAt = t;
-      this.clashNow();
+      this.clashNow(pan);
     });
   }
 
-  private clashNow(): void {
-    this.duck(0.55, 0.7);
-    // Soft thump — long, low-Q noise burst with gentle filter sweep. No tone.
+  private clashNow(pan: number): void {
+    this.duck(0.72, 0.6);
     this.noiseBurst({
-      dur: 0.14,
-      gain: 0.09,
+      dur: 0.15,
+      gain: 0.085,
       filterType: 'bandpass',
-      filterFreq: 520,
+      filterFreq: 520 * range(this.rng, 0.9, 1.15),
       filterTo: 1100,
       q: 1.4,
+      pan,
+      send: 0.35,
     });
   }
 
-  death(): void {
+  death(pan = 0): void {
     this.whenRunning(() => {
       const t = performance.now();
       if (t - this.lastDeathAt < 90) return;
       this.lastDeathAt = t;
-      this.deathNow();
+      this.deathNow(pan);
     });
   }
 
-  private deathNow(): void {
+  private deathNow(pan: number): void {
+    // Randomise pitch and timing a touch — a wave of deaths used to fire as
+    // one machine-gun burst of identical clicks.
+    const jitter = range(this.rng, 0.88, 1.14);
     this.tone({
-      freq: 200,
+      freq: 200 * jitter,
       slideTo: 64,
-      dur: 0.55,
+      dur: 0.6,
       type: 'sine',
-      gain: 0.06,
+      gain: 0.055,
       attack: 0.02,
       filterFreq: 500,
+      delay: range(this.rng, 0, 0.03),
+      pan,
+      send: 0.4,
     });
     this.noiseBurst({
-      dur: 0.18,
+      dur: 0.2,
       gain: 0.04,
       filterType: 'lowpass',
       filterFreq: 480,
       q: 0.5,
+      pan,
+      send: 0.3,
     });
   }
 
-  burn(): void {
+  burn(pan = 0): void {
     this.whenRunning(() => {
       const t = performance.now();
       if (t - this.lastBurnAt < 400) return;
       this.lastBurnAt = t;
-      this.burnNow();
+      this.burnNow(pan);
     });
   }
 
-  private burnNow(): void {
-    this.duck(0.45, 1.1);
+  private burnNow(pan: number): void {
+    this.duck(0.6, 1.1);
     this.tone({
       freq: 64,
-      dur: 0.55,
+      dur: 0.6,
       type: 'sine',
       gain: 0.055,
       attack: 0.04,
       filterFreq: 180,
+      pan: pan * 0.4,
+      send: 0.2,
     });
     this.noiseBurst({
-      dur: 0.45,
+      dur: 0.5,
       gain: 0.06,
       filterType: 'lowpass',
       filterFreq: 420,
       filterTo: 160,
       q: 0.5,
+      pan,
+      send: 0.4,
     });
     for (let i = 0; i < 5; i++) {
       this.noiseBurst({
         dur: 0.05,
-        gain: 0.04,
+        gain: 0.038,
         filterType: 'highpass',
         filterFreq: 1800,
         q: 0.8,
         delay: 0.04 + i * 0.07,
-        pan: rand(-0.5, 0.5),
+        pan: clampPan(pan + range(this.rng, -0.4, 0.4)),
+        send: 0.5,
       });
     }
   }
 
-  fail(): void {
-    this.whenRunning(() => this.failNow());
+  fail(pan = 0): void {
+    this.whenRunning(() => this.failNow(pan));
   }
 
-  private failNow(): void {
+  private failNow(pan: number): void {
+    const tones = chordTones(this.mode, this.degree(), 3);
     this.tone({
-      freq: hz(7, this.ratio),
+      freq: this.freq(tones[1]!),
       dur: 0.16,
       type: 'sine',
-      gain: 0.06,
+      gain: 0.055,
       filterFreq: 1200,
+      pan,
+      send: 0.2,
     });
     this.tone({
-      freq: hz(3, this.ratio),
-      dur: 0.22,
+      freq: this.freq(tones[0]!),
+      dur: 0.24,
       type: 'triangle',
-      gain: 0.045,
+      gain: 0.04,
       delay: 0.07,
       filterFreq: 1000,
+      pan,
+      send: 0.2,
     });
   }
 
   win(): void {
     this.mood = 'won';
     this.whenRunning(() => {
-      // Brighten the bed: open the wet/dry mix over 8 s, lift cutoff.
+      this.mode = moodMode(this.mode, 'won');
       this.transitionBed(1.05, 1.25);
-      const notes = [12, 16, 19, 24, 28, 31];
-      for (let i = 0; i < notes.length; i++) {
-        this.tone({
-          freq: hz(notes[i]!, this.ratio),
-          dur: 0.85,
-          type: 'sine',
-          gain: 0.08,
-          attack: 0.025,
-          delay: i * 0.09,
+      // A last statement of the theme, up an octave, in the brightened mode.
+      const notes = this.motif;
+      let t = this.ctx!.currentTime + 0.15;
+      for (const note of notes) {
+        this.fmStrike({
+          when: t,
+          freq: this.freq(ladderSemis(this.mode, note.step) + 24),
+          ratio: 2.01,
+          index: 2,
+          modDecay: 0.1,
+          decay: 1.8,
+          gain: 0.085,
+          pan: range(this.rng, -0.25, 0.25),
+          send: 0.9,
         });
+        t += note.dur * 0.5;
       }
-      for (const s of [0, 4, 7, 11, 16]) {
+      for (const s of chordTones(this.mode, 0, 4)) {
         this.tone({
-          freq: hz(s, this.ratio),
-          dur: 2.2,
+          freq: this.freq(s),
+          dur: 2.4,
           type: 'warm',
           gain: 0.045,
           attack: 0.2,
+          send: 0.6,
         });
       }
     });
@@ -922,54 +1096,56 @@ export class GameAudio {
   lose(): void {
     this.mood = 'lost';
     this.whenRunning(() => {
-      // Darken the bed: dry cut, wet open, cutoff down — over 8 s.
+      this.mode = moodMode(this.mode, 'lost');
       this.transitionBed(0.7, 0.5);
-      const notes = [12, 7, 3, 0, -5];
+      // The theme sinking: same shape, each restatement lower and slower.
+      const notes = this.motif;
+      let t = this.ctx!.currentTime + 0.15;
       for (let i = 0; i < notes.length; i++) {
-        this.tone({
-          freq: hz(notes[i]!, this.ratio),
-          dur: 1.05,
-          type: 'sine',
+        this.fmStrike({
+          when: t,
+          freq: this.freq(ladderSemis(this.mode, notes[i]!.step - i)),
+          ratio: 2.01,
+          index: 1.4,
+          modDecay: 0.14,
+          decay: 2.6,
           gain: 0.06,
-          attack: 0.04,
-          delay: i * 0.2,
-          filterFreq: 600,
+          pan: range(this.rng, -0.2, 0.2),
+          send: 0.8,
         });
+        t += notes[i]!.dur * 0.9;
       }
     });
   }
 
-  /**
-   * Smoothly transition the bed's dry/wet balance and overall cutoff for
-   * win/lose moods. Reverts to neutral when called again later.
-   */
+  /** Move the bed's dry/wet balance for the win/lose moods, over 8 s. */
   private transitionBed(dryMul: number, wetMul: number): void {
-    if (!this.ctx || !this.musicDry || !this.musicWet) return;
+    if (!this.ctx || !this.dryGain || !this.wetGain) return;
     const now = this.ctx.currentTime;
-    this.musicDry.gain.cancelScheduledValues(now);
-    this.musicDry.gain.setValueAtTime(this.musicDry.gain.value, now);
-    this.musicDry.gain.linearRampToValueAtTime(0.65 * dryMul, now + 8);
-    this.musicWet.gain.cancelScheduledValues(now);
-    this.musicWet.gain.setValueAtTime(this.musicWet.gain.value, now);
-    this.musicWet.gain.linearRampToValueAtTime(0.35 * wetMul, now + 8);
-    if (this.voiceFilter) {
-      const target = this.dark ? 760 : 1080;
-      const targetMul = this.mood === 'won' ? 1.2 : this.mood === 'lost' ? 0.6 : 1;
-      this.voiceFilter.frequency.setTargetAtTime(target * targetMul, now, 3);
-    }
+    this.dryGain.gain.cancelScheduledValues(now);
+    this.dryGain.gain.setValueAtTime(this.dryGain.gain.value, now);
+    this.dryGain.gain.linearRampToValueAtTime(0.62 * dryMul, now + 8);
+    this.wetGain.gain.cancelScheduledValues(now);
+    this.wetGain.gain.setValueAtTime(this.wetGain.gain.value, now);
+    this.wetGain.gain.linearRampToValueAtTime(0.5 * wetMul, now + 8);
   }
+}
 
-  setEnabled(on: boolean): void {
-    this.enabled = on;
-    if (this.master && this.ctx) {
-      const now = this.ctx.currentTime;
-      this.master.gain.cancelScheduledValues(now);
-      this.master.gain.setValueAtTime(on ? MASTER : 0.0001, now);
-    }
-    if (!on) {
-      this.stopMusicBeds();
-      return;
-    }
-    if (this.unlocked) this.startAmbient();
+function clampPan(pan: number): number {
+  return Math.max(-1, Math.min(1, pan));
+}
+
+function safeDisconnect(node: AudioNode | null | undefined): void {
+  if (!node) return;
+  try {
+    node.disconnect();
+  } catch {
+    /* already disconnected */
   }
+}
+
+function makeWarmWave(ctx: AudioContext): PeriodicWave {
+  const real = new Float32Array([0, 1, 0.18, 0.08, 0.03, 0.015]);
+  const imag = new Float32Array(real.length);
+  return ctx.createPeriodicWave(real, imag);
 }

@@ -1,6 +1,7 @@
 import { Graphics } from 'pixi.js';
 import { mulberry32 } from '../sim/rng';
 import type { SeedlingKind, Stats } from '../sim/types';
+import { paintGlowEllipse } from './glow';
 import { seedlingColors, type ScenePalette } from './palette';
 
 export interface HullPaintOptions {
@@ -73,15 +74,15 @@ export function paintSeedHull(
   const extraWings = v >= 0.85;
   const twinBarb = p >= 1.05;
 
-  // Aura grows when the pod is open; closes as the seed detaches.
-  // Stacked low-alpha rings approximate a radial gradient so the silhouette
-  // never shows a hard ellipse edge.
+  // Aura grows when the pod is open; closes as the seed detaches. A baked
+  // radial ramp, so the silhouette never shows a hard ellipse edge and the
+  // aura costs one ellipse instead of a stack of them.
   const openAura = 0.4 + open * 0.6;
   const auraX = (bodyL * 0.62 + husk * 0.2) * openAura;
   const auraY = (bodyW + husk * 0.55) * openAura;
   const auraK = mixAlpha(1, departure, 0.35);
-  paintSoftGlow(g, bodyL * 0.02, 0, auraX * 1.05, auraY, wing, (sentinel ? 0.07 : 0.045) * auraK, 5);
-  paintSoftGlow(g, bodyL * 0.04, 0, auraX * 0.72, auraY * 0.68, wing, (sentinel ? 0.08 : 0.055) * auraK, 4);
+  paintGlowEllipse(g, bodyL * 0.02, 0, auraX * 1.05, auraY, wing, (sentinel ? 0.07 : 0.045) * auraK, 5);
+  paintGlowEllipse(g, bodyL * 0.04, 0, auraX * 0.72, auraY * 0.68, wing, (sentinel ? 0.08 : 0.055) * auraK, 4);
 
   // Fins spread with openness. The sprite-level seedling already
   // animates openness via visualScale; here we just keep them.
@@ -212,32 +213,6 @@ function paintBarb(
 
 function clamp01(v: number): number {
   return Math.max(0, Math.min(1, v));
-}
-
-/**
- * Soft glow approximated by concentric rings of decreasing alpha. Each ring
- * shrinks toward the centre so the silhouette never reads as a hard ellipse
- * edge — just a bloom of light. `rings` controls how smooth the falloff is;
- * 4–6 is enough for a single-px scale while staying cheap.
- */
-function paintSoftGlow(
-  g: Graphics,
-  x: number,
-  y: number,
-  rx: number,
-  ry: number,
-  color: number,
-  alpha: number,
-  rings: number,
-): void {
-  if (alpha <= 0.002 || rx <= 0.05 || ry <= 0.05) return;
-  const n = Math.max(2, rings | 0);
-  for (let i = 0; i < n; i++) {
-    const u = 1 - i / n;
-    const e = u * u;
-    g.ellipse(x, y, rx * u, ry * u);
-    g.fill({ color, alpha: alpha * e });
-  }
 }
 
 function mixAlpha(a: number, dep: number, weight: number): number {
