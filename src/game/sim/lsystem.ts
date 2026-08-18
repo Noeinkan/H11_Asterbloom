@@ -77,6 +77,26 @@ export interface TreeGeom {
 type Pt = { x: number; y: number };
 
 /**
+ * A subsurface pocket already converted into tree-local coordinates so the
+ * L-system can fork a root toward it. The caller (`treeView.adultGeom`)
+ * owns the conversion from asteroid polar (`angle`, `radiusT`) to the
+ * tree's frame, so the geometry stays deterministic for `(treeSeed,
+ * asteroidSeed)`.
+ */
+export interface PocketTarget {
+  /** Tree-local position of the pocket. */
+  x: number;
+  y: number;
+  /**
+   * 0..1 along the inward direction (tree-local +y). Drives the seek
+   * curve's depth bias so deep pockets pull the tip further in.
+   */
+  depthT: number;
+  /** Flag for the renderer (root hue, miner / water / energy tone). */
+  kind: 'mineral' | 'water' | 'energy';
+}
+
+/**
  * One living plant: wood grows from the collar into the canopy, while
  * searching roots hunt the core. `maturity` extends length and thickens
  * wood/roots toward the baked adult silhouette.
@@ -101,6 +121,7 @@ export function buildAdultTree(
   coreDepth = 70,
   surfaceY = 0,
   kind?: TreeKind,
+  pocketTargets?: PocketTarget[],
 ): TreeGeom {
   const rng = mulberry32(seed >>> 0);
   const strokes: TreeStroke[] = [];
@@ -148,6 +169,14 @@ export function buildAdultTree(
     rootSpan,
     strokes,
   );
+
+  // Optional pocket-seeking offshoots: thin tendrils that fork from the
+  // main root system and bend toward each subsurface pocket, so the
+  // connection reads as a real root reaching the resource instead of a
+  // painted line across the rock. Caller passes pockets already converted
+  // into tree-local space (= pocketPositionTree()) so the geometry stays
+  // deterministic for a given tree seed + asteroid seed.
+  growPocketSeekers(rng, scale, pocketTargets, rootEmerge, rootSpan, strokes);
 
   const laterals = 2 + Math.floor(rng() * 2);
   spawnLaterals(
@@ -530,6 +559,106 @@ function growNervousRoots(
       false,
       roots,
     );
+  }
+}
+
+/**
+ * Forks thin root tendrils off the main nervous system toward each
+ * subsurface pocket. Each tendril anchors at the closest point of the
+ * nearest existing root stroke, then wanders toward the pocket in
+ * tree-local space with a gentle S-curve. Emerge / span are staggered so
+ * a young tree only shows a few tips and a mature tree reveals all of
+ * them. The renderer reads `points` as a normal root stroke, so the
+ * tendril inherits the wood→root crossfade and sap flow.
+ */
+function growPocketSeekers(
+  rng: Rng,
+  scale: number,
+  pockets: PocketTarget[] | undefined,
+  emerge: number,
+  span: number,
+  roots: TreeStroke[],
+): void {
+  if (!pockets || pockets.length === 0) return;
+  const rootFromList = roots.filter((s) => s.kind === 'root');
+  if (rootFromList.length === 0) return;
+
+  for (let i = 0; i < pockets.length; i++) {
+    const p = pockets[i]!;
+    let bestDist = Infinity;
+    let bestA: Pt | null = null;
+    let bestB: Pt | null = null;
+    let bestT = 0;
+    for (const s of rootFromList) {
+      const pts = s.points;
+      if (pts.length < 2) continue;
+      for (let k = 0; k < pts.length - 1; k++) {
+        const a = pts[k]!;
+        const b = pts[k + 1]!;
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const len2 = dx * dx + dy * dy;
+        if (len2 < 1e-6) continue;
+        let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
+        t = Math.min(1, Math.max(0, t));
+        const cx = a.x + dx * t;
+        const cy = a.y + dy * t;
+        const d = Math.hypot(p.x - cx, p.y - cy);
+        if (d < bestDist) {
+          bestDist = d;
+          bestA = a;
+          bestB = b;
+          bestT = t;
+        }
+      }
+    }
+    if (!bestA || !bestB) continue;
+    if (bestDist > 38 * scale) continue;
+
+    const anchor: Pt = {
+      x: bestA.x + (bestB.x - bestA.x) * bestT,
+      y: bestA.y + (bestB.y - bestA.y) * bestT,
+    };
+
+    const reach = Math.hypot(p.x - anchor.x, p.y - anchor.y);
+    if (reach < 1.5) continue;
+    const steps = Math.max(6, Math.round(reach / (2.6 * scale)));
+    const phase = rng() * Math.PI * 2;
+    const waves = range(rng, 0.4, 0.8);
+    const amp = range(rng, 0.05, 0.12) * (rng() < 0.5 ? -1 : 1);
+    const pts: Pt[] = [{ x: anchor.x, y: anchor.y }];
+    let x = anchor.x;
+    let y = anchor.y;
+    let a = Math.atan2(p.y - anchor.y, p.x - anchor.x);
+    for (let k = 1; k <= steps; k++) {
+      const u = k / steps;
+      const sweep = Math.sin(u * waves * Math.PI * 2 + phase) * amp;
+      const toPocket = Math.atan2(p.y - y, p.x - x);
+      const closeness = 1 - Math.min(1, Math.hypot(p.x - x, p.y - y) / reach);
+      a = a + (toPocket - a) * (0.22 + 0.18 * closeness) + sweep;
+      const stepLen = reach / steps;
+      x += Math.cos(a) * stepLen;
+      y += Math.sin(a) * stepLen;
+      if (k === steps) {
+        x = p.x;
+        y = p.y;
+      }
+      pts.push({ x, y });
+    }
+
+    const depthBias = Math.min(0.5, Math.max(0.18, 0.5 - p.depthT * 0.3));
+    const tipEmerge = emerge + span * (0.32 + 0.42 * depthBias + (i % 2) * 0.08);
+    const tipSpan = Math.max(0.16, span * (0.55 + rng() * 0.3));
+
+    const baseW = Math.max(0.34 * scale, 0.5 * scale);
+    roots.push({
+      points: pts,
+      widthStart: baseW,
+      widthEnd: Math.max(0.22 * scale, baseW * 0.4),
+      kind: 'root',
+      emerge: tipEmerge,
+      span: tipSpan,
+    });
   }
 }
 

@@ -1,0 +1,97 @@
+import type { World } from '../sim/types';
+
+export interface FactionPlate {
+  root: HTMLDivElement;
+  setVisible(visible: boolean): void;
+  sync(world: World, selectedAsteroidId: number | null): void;
+  destroy(): void;
+}
+
+const GAP_PX = 8;
+
+/**
+ * Always-visible bottom-left "colony name" plate. Names the player's home
+ * rock and falls back to the selected rock when the home is destroyed. The
+ * plate sits just above the bottom HUD bar; its offset tracks the bar's real
+ * height so it stays clear of the inspector even when the bar wraps to
+ * multiple lines on narrow screens.
+ */
+export function createFactionPlate(
+  host: HTMLElement,
+  anchor?: HTMLElement | null,
+): FactionPlate {
+  const root = document.createElement('div');
+  root.className = 'hud-faction-plate';
+  root.hidden = true;
+  root.innerHTML = `
+    <span class="hud-faction-plate-name"></span>
+  `;
+  host.appendChild(root);
+
+  const nameEl = root.querySelector<HTMLSpanElement>('.hud-faction-plate-name')!;
+
+  let lastName = '';
+
+  const resolveName = (
+    world: World,
+    selectedAsteroidId: number | null,
+  ): string => {
+    let home: { name: string } | undefined;
+    for (const a of world.asteroids.values()) {
+      if (a.owner === 'player') {
+        home = a;
+        break;
+      }
+    }
+    if (home) return home.name;
+    if (selectedAsteroidId !== null) {
+      const sel = world.asteroids.get(selectedAsteroidId);
+      if (sel) return sel.name;
+    }
+    return '';
+  };
+
+  const updateOffset = () => {
+    const safeBottom = parseFloat(
+      getComputedStyle(document.documentElement)
+        .getPropertyValue('--ab-safe-bottom')
+        || '12',
+    ) || 12;
+    let barHeight = 0;
+    if (anchor && anchor.isConnected && !anchor.hidden) {
+      barHeight = anchor.getBoundingClientRect().height;
+    }
+    const total = safeBottom + barHeight + GAP_PX;
+    root.style.setProperty('--ab-plate-bottom', `${total}px`);
+  };
+
+  let resizeObserver: ResizeObserver | null = null;
+  if (typeof ResizeObserver !== 'undefined' && anchor) {
+    resizeObserver = new ResizeObserver(() => updateOffset());
+    resizeObserver.observe(anchor);
+  }
+  window.addEventListener('resize', updateOffset);
+
+  return {
+    root,
+
+    setVisible(visible) {
+      root.hidden = !visible;
+      updateOffset();
+    },
+
+    sync(world, selectedAsteroidId) {
+      const next = resolveName(world, selectedAsteroidId);
+      if (next === lastName) return;
+      lastName = next;
+      nameEl.textContent = next;
+    },
+
+    destroy() {
+      resizeObserver?.disconnect();
+      resizeObserver = null;
+      window.removeEventListener('resize', updateOffset);
+      root.remove();
+    },
+  };
+}

@@ -263,9 +263,13 @@ describe('world sandbox', () => {
   it('does not drop seedlings until branches emerge', () => {
     const world = createSandboxWorld(201);
     const treeId = [...world.trees.keys()][0]!;
-    const preGateSec = DYSON_GROWTH_SECONDS * SPAWN_START_MATURITY * 0.9;
+    // Stop short of the spawn gate so the dietary bias loop (which adds
+    // ~DIET_GROWTH_RATE per second on top of the base rate) cannot push
+    // maturity across SPAWN_START_MATURITY during the pre-gate phase.
+    const preGateSec = DYSON_GROWTH_SECONDS * SPAWN_START_MATURITY * 0.8;
     for (let i = 0; i < 60 * preGateSec; i++) tick(world, 1 / 60);
-    expect(world.trees.get(treeId)!.maturity).toBeLessThan(SPAWN_START_MATURITY);
+    const maturity = world.trees.get(treeId)!.maturity;
+    expect(maturity).toBeLessThan(SPAWN_START_MATURITY);
     expect(world.seedlings.size).toBe(0);
     expect(world.trees.get(treeId)!.spawnAccumulator).toBe(0);
 

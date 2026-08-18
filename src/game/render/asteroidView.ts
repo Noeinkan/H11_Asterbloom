@@ -21,7 +21,6 @@ import {
   treeVisualScale,
   type Asteroid,
   type FactionId,
-  type ResourceKind,
   type Tree,
   type TreeKind,
   type World,
@@ -38,11 +37,11 @@ import {
   floraPalette,
   hslToHex,
   mixHex,
+  resourceKindHex,
   sapRiseU,
   sapStage,
   SAP_WINDOW,
   type FloraPalette,
-  type Hex,
   type ScenePalette,
 } from './palette';
 import { paintSoftRing } from './treeView';
@@ -51,13 +50,16 @@ const NO_TREES: Tree[] = [];
 const SUBSTRATE_BINS = 180;
 const POLLEN_CAP = 64;
 const LIFE_ANIM_DT = 1 / 12;
+/**
+ * Pocket orbs and the moss film breathe slowly, but both were rebuilding
+ * their whole `Graphics` every frame — the pockets alone are ~15 filled
+ * shapes each, and the film re-tessellates a rim polygon plus 180 speckles.
+ * Rebuilding at 12 Hz is indistinguishable from 60 Hz for a 1 Hz pulse and
+ * costs a fifth of the geometry work.
+ */
+const POCKET_ANIM_DT = 1 / 12;
+const FILM_ANIM_DT = 1 / 12;
 
-/** Pocket inner-ring color by resource kind. */
-function kindHex(kind: ResourceKind, pal: FloraPalette): Hex {
-  if (kind === 'mineral') return mixHex(pal.stain, pal.rockShadow, 0.3);
-  if (kind === 'water') return mixHex(pal.coreWhite, pal.film, 0.4);
-  return mixHex(pal.core, pal.coreHot, 0.4);
-}
 /**
  * Film inset as a fraction of rock radius — stays near ROCK_SURFACE_INSET.
  * Unused constants from the original film-front model were dropped after the
@@ -104,6 +106,9 @@ export class AsteroidView {
   private bloomCache = new Map<number, { key: string; blooms: TreeFlower[] }>();
   private grassAcc = 0;
   private lastGrassTime = 0;
+  private pocketPaintedAt = -Infinity;
+  private filmPaintedAt = -Infinity;
+  private stainAcc = 0;
   private substrateDirty = true;
   private lifeDirty = true;
   private seededTrees = new Set<number>();
@@ -257,7 +262,11 @@ export class AsteroidView {
       this.selectionRing.scale.set(1);
     }
 
-    this.paintPockets(asteroid, t);
+    if (t - this.pocketPaintedAt >= POCKET_ANIM_DT) {
+      this.pocketPaintedAt = t;
+      this.rebuildPocketCache(asteroid);
+      this.paintPockets(asteroid, t);
+    }
   }
 
   private paintPockets(asteroid: Asteroid, time: number): void {
@@ -270,9 +279,14 @@ export class AsteroidView {
     for (const pocket of pockets) {
       const px = Math.cos(pocket.angle) * pocket.radiusT * asteroid.radius;
       const py = Math.sin(pocket.angle) * pocket.radiusT * asteroid.radius;
-      const depthA = 0.45 + (1 - pocket.depthT) * 0.4;
+      const depthA = 0.55 + (1 - pocket.depthT) * 0.35;
       const pulse = 0.5 + 0.5 * Math.sin(time * 0.9 + pocket.phase);
-      const kColor = kindHex(pocket.kind, this.pal);
+      const kColor = resourceKindHex(pocket.kind, this.pal);
+      // Ring sizes track the rock so a pocket reads as a subsurface orb,
+      // not a speck. Full pockets swell slightly with the amount left.
+      const fill =
+        pocket.maxAmount > 0 ? pocket.amount / pocket.maxAmount : 1;
+      const size = asteroid.radius * 0.1 * (0.72 + 0.28 * fill);
 
       // Feeding flash: brighten briefly when the pocket is actively drained.
       const last = this.pocketLastAmount.get(pocket.id);
@@ -288,30 +302,30 @@ export class AsteroidView {
         g,
         px,
         py,
-        pocket.amount * 0.7,
+        size,
         -1,
         mixHex(this.pal.rootGlow, kColor, 0.35),
-        (0.1 + 0.06 * pulse) * depthA,
+        (0.16 + 0.1 * pulse) * depthA,
         5,
       );
       paintSoftRing(
         g,
         px,
         py,
-        pocket.amount * 0.45,
+        size * 0.64,
         -1,
         mixHex(this.pal.rootGlow, kColor, 0.6),
-        (0.16 + 0.08 * pulse) * depthA,
+        (0.28 + 0.12 * pulse) * depthA,
         4,
       );
       paintSoftRing(
         g,
         px,
         py,
-        pocket.amount * 0.18,
+        size * 0.26,
         -1,
         kColor,
-        (0.32 + 0.12 * pulse + flash * 0.45) * depthA,
+        (0.5 + 0.16 * pulse + flash * 0.45) * depthA,
         3,
       );
 
@@ -320,13 +334,58 @@ export class AsteroidView {
           g,
           px,
           py,
-          pocket.amount * 0.85,
+          size * 0.85,
           -1,
           kColor,
-          0.28 * flash * depthA,
+          0.3 * flash * depthA,
           3,
         );
       }
+
+      // Subtle kind glyph so water / mineral / energy are distinguishable
+      // without dominating the soft orb. Sized under 40% of the pocket so
+      // it never overwhelms the resource cost it sits inside.
+      paintPocketGlyph(g, px, py, size * 0.36, pocket.kind, kColor, depthA, pulse);
+    }
+  }
+
+  /**
+   * Tiny shape inside the pocket that hints at the resource family without
+   * breaking the soft pastel palette. Three glyphs:
+   *   - mineral: angled diamond (think crystal lattice)
+   *   - water:   flat ellipse + crescent (meniscus)
+   *   - energy:  four short spikes (spark)
+   * All rendered at low alpha so the layer reads as a hint, not an icon.
+   */
+  private pickPocketCache: {
+    id: number;
+    x: number;
+    y: number;
+    r: number;
+    kind: 'mineral' | 'water' | 'energy';
+  }[] = [];
+
+  pickPocket(worldX: number, worldY: number): { pocketId: number; asteroidId: number } | null {
+    for (const p of this.pickPocketCache) {
+      const dx = p.x - worldX;
+      const dy = p.y - worldY;
+      if (dx * dx + dy * dy <= p.r * p.r) {
+        return { pocketId: p.id, asteroidId: this.asteroidId };
+      }
+    }
+    return null;
+  }
+
+  private rebuildPocketCache(asteroid: Asteroid): void {
+    this.pickPocketCache.length = 0;
+    for (const pocket of asteroid.pockets) {
+      this.pickPocketCache.push({
+        id: pocket.id,
+        x: Math.cos(pocket.angle) * pocket.radiusT * asteroid.radius,
+        y: Math.sin(pocket.angle) * pocket.radiusT * asteroid.radius,
+        r: asteroid.radius * 0.13,
+        kind: pocket.kind,
+      });
     }
   }
 
@@ -340,10 +399,11 @@ export class AsteroidView {
     // 1° hue bucket: ~360 repaints per full cycle. Visually smooth, cheap.
     const bucket = bucketHue(scene.hue);
     const themeChanged = scene.theme !== undefined && scene.theme !== this.lastTheme;
-    if (bucket === this.lastHueBucket && !themeChanged) {
-      this.label.style.fill = scene.inkSoft;
-      return;
-    }
+    // The label fill used to be written on this early-out path too. `inkSoft`
+    // drifts with the hue, so that assignment landed a new value most frames
+    // and re-rasterized the name texture — for every rock, every frame. It
+    // now moves with the rest of the palette, below.
+    if (bucket === this.lastHueBucket && !themeChanged) return;
     this.lastHueBucket = bucket;
     this.lastTheme = scene.theme;
     this.pal = floraPalette(asteroid.stats, asteroid.seed, scene);
@@ -454,7 +514,7 @@ export class AsteroidView {
         remaining = true;
       }
       if (remaining) this.substrateDirty = true;
-      this.paintSubstrate(asteroid);
+      this.paintSubstrate(asteroid, time);
       return;
     }
 
@@ -467,17 +527,24 @@ export class AsteroidView {
 
     // Active substrate creep: even before blooms open, the sward keeps
     // expanding along the rim so grass follows lifeSpread without waiting
-    // for the first pollen grains to fall.
-    for (const tree of trees) {
-      if (tree.maturity < 0.18) continue;
-      const polar = plantPose(asteroid, tree.slotIndex, tree.plantAngle);
-      const reach = Math.min(1.2, Math.max(0, (tree.maturity - 0.18) / 0.82));
-      const span = 0.05 + 1.1 * reach;
-      this.stainArc(polar.angle, span, dt * (0.18 + 0.45 * reach));
+    // for the first pollen grains to fall. A full arc touches a few hundred
+    // bins, so the creep runs on the film cadence with the elapsed time
+    // banked up — same total staining, a twelfth of the work.
+    this.stainAcc += dt;
+    if (this.stainAcc >= FILM_ANIM_DT) {
+      const stainDt = this.stainAcc;
+      this.stainAcc = 0;
+      for (const tree of trees) {
+        if (tree.maturity < 0.18) continue;
+        const polar = plantPose(asteroid, tree.slotIndex, tree.plantAngle);
+        const reach = Math.min(1.2, Math.max(0, (tree.maturity - 0.18) / 0.82));
+        const span = 0.05 + 1.1 * reach;
+        this.stainArc(polar.angle, span, stainDt * (0.18 + 0.45 * reach));
+      }
     }
 
     if (!showMotes) {
-      this.paintSubstrate(asteroid);
+      this.paintSubstrate(asteroid, time);
       return;
     }
 
@@ -590,7 +657,7 @@ export class AsteroidView {
       next.push(grain);
     }
     this.pollen = next;
-    this.paintSubstrate(asteroid);
+    this.paintSubstrate(asteroid, time);
   }
 
   private stain(theta: number, amount: number): void {
@@ -616,8 +683,14 @@ export class AsteroidView {
     }
   }
 
-  private paintSubstrate(asteroid: Asteroid): void {
+  private paintSubstrate(asteroid: Asteroid, time: number): void {
     if (!this.substrateDirty) return;
+    // The substrate is stained a little every frame while a tree grows, so
+    // the dirty flag alone would mean a full re-tessellation at 60 Hz. Hold
+    // the flag until the next slot instead — the moss creeps at the speed of
+    // tree growth, nowhere near frame rate.
+    if (time - this.filmPaintedAt < FILM_ANIM_DT) return;
+    this.filmPaintedAt = time;
     this.substrateDirty = false;
     const g = this.film;
     g.clear();
@@ -823,6 +896,68 @@ export function plantableEmptySlots(
     if (!occupied.has(i)) empty.add(i);
   }
   return empty.size === 0 ? EMPTY_PLANTABLE : empty;
+}
+
+function paintPocketGlyph(
+  g: Graphics,
+  x: number,
+  y: number,
+  size: number,
+  kind: 'mineral' | 'water' | 'energy',
+  color: number,
+  depthA: number,
+  pulse: number,
+): void {
+  const base = 0.4 + 0.18 * pulse;
+  const alpha = base * depthA;
+  if (kind === 'mineral') {
+    // Diamond: rotated square at small angle. Reads as a crystal face.
+    const r = size * 0.92;
+    g.moveTo(x, y - r);
+    g.lineTo(x + r * 0.78, y);
+    g.lineTo(x, y + r);
+    g.lineTo(x - r * 0.78, y);
+    g.closePath();
+    g.fill({ color, alpha: alpha * 0.55 });
+    g.stroke({ color, width: 0.6, alpha: alpha * 0.7 });
+    // Inner facet for a hint of depth.
+    g.moveTo(x, y - r * 0.55);
+    g.lineTo(x + r * 0.42, y);
+    g.lineTo(x, y + r * 0.55);
+    g.lineTo(x - r * 0.42, y);
+    g.closePath();
+    g.fill({ color, alpha: alpha * 0.22 });
+    return;
+  }
+  if (kind === 'water') {
+    // Meniscus: flat ellipse on top, a thin crescent underneath.
+    const rx = size * 0.86;
+    const ry = size * 0.32;
+    g.ellipse(x, y - size * 0.18, rx, ry);
+    g.fill({ color, alpha: alpha * 0.5 });
+    g.ellipse(x, y + size * 0.12, rx * 0.92, ry * 0.92);
+    g.fill({ color, alpha: alpha * 0.35 });
+    // Surface tension line.
+    g.moveTo(x - rx * 0.85, y - size * 0.18);
+    g.lineTo(x + rx * 0.85, y - size * 0.18);
+    g.stroke({ color, width: 0.55, alpha: alpha * 0.7 });
+    return;
+  }
+  // Energy: four-pulse spark. Two crossed lines clipped into the inner ring.
+  const len = size * 0.94;
+  const short = size * 0.55;
+  for (let k = 0; k < 4; k++) {
+    const a = (k * Math.PI) / 2;
+    const dx = Math.cos(a) * len;
+    const dy = Math.sin(a) * len;
+    const sx = Math.cos(a) * short;
+    const sy = Math.sin(a) * short;
+    g.moveTo(x - sx, y - sy);
+    g.lineTo(x + dx, y + dy);
+    g.stroke({ color, width: 0.7, alpha: alpha * 0.85 });
+  }
+  g.circle(x, y, size * 0.28);
+  g.fill({ color, alpha: alpha * 0.55 });
 }
 
 function paintRock(g: Graphics, asteroid: Asteroid, pal: FloraPalette): void {

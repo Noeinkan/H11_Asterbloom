@@ -11,7 +11,7 @@
  *      toward the scene hue and pastelize — so every asteroid’s flora differs.
  */
 import { mulberry32 } from '../sim/rng';
-import type { FactionId, SeedlingKind, Stats } from '../sim/types';
+import type { FactionId, ResourceKind, SeedlingKind, Stats } from '../sim/types';
 
 export type Hex = number;
 
@@ -114,6 +114,17 @@ export function mixHex(a: Hex, b: Hex, t: number): Hex {
   const [ar, ag, ab] = hexToRgb(a);
   const [br, bg, bb] = hexToRgb(b);
   return rgbToHex(ar + (br - ar) * u, ag + (bg - ag) * u, ab + (bb - ab) * u);
+}
+
+/**
+ * Pocket accent color by resource kind. Mineral reads warm brown, water a
+ * cool blue-cyan, energy a warm yellow-green — all pulled from the same
+ * flora palette so each rock keeps a coherent tint.
+ */
+export function resourceKindHex(kind: ResourceKind, pal: FloraPalette): Hex {
+  if (kind === 'mineral') return mixHex(pal.stain, pal.rockShadow, 0.3);
+  if (kind === 'water') return mixHex(pal.coreWhite, pal.film, 0.4);
+  return mixHex(pal.core, pal.coreHot, 0.4);
 }
 
 /** h in 0–360, s/l in 0–1 */
@@ -298,10 +309,13 @@ export function buildSceneForTheme(
   let dark: boolean;
   switch (theme) {
     case "void":
-      // Original dark space void — the safe default.
-      bgA = hslToHex(h, 0.26, 0.04);
-      bgB = hslToHex(h + 32, 0.18, 0.085);
-      bgC = hslToHex(h - 48, 0.24, 0.05);
+      // Dark space void with visible color bands. The gradient backs onto
+      // bgA/bgC at the page edges (luminance ≈ 5%) so the screen reads as
+      // space, and rises to bgB plateau (luminance ≈ 40%) so the wash
+      // shows a colored band rather than collapsing to monochrome black.
+      bgA = hslToHex(h, 0.26, 0.05);
+      bgB = hslToHex(h + 32, 0.4, 0.4);
+      bgC = hslToHex(h - 48, 0.24, 0.06);
       ink = hslToHex(h, 0.16, 0.82);
       inkSoft = hslToHex(h, 0.12, 0.7);
       mist = toPastel(hslToHex(h, 0.4, 0.7));
@@ -324,7 +338,7 @@ export function buildSceneForTheme(
       // Mid-light wash with a green→violet axis. Mist reads as the aurora's
       // highlight band; dust trails behind it in dusty pink.
       bgA = hslToHex(h, 0.18, 0.18);
-      bgB = hslToHex(h + 32, 0.22, 0.22);
+      bgB = hslToHex(h + 32, 0.4, 0.4);
       bgC = hslToHex(h - 24, 0.16, 0.12);
       ink = hslToHex(h + 110, 0.24, 0.78);
       inkSoft = hslToHex(h + 110, 0.18, 0.62);
@@ -336,7 +350,7 @@ export function buildSceneForTheme(
       // Deep magenta dust with cyan stars. Hue drifts more than the other
       // themes so the nebula center swings warm/cool as the cycle turns.
       bgA = hslToHex(h, 0.32, 0.06);
-      bgB = hslToHex(h + 40, 0.28, 0.1);
+      bgB = hslToHex(h + 40, 0.4, 0.4);
       bgC = hslToHex(h - 60, 0.26, 0.05);
       ink = hslToHex(h + 200, 0.22, 0.82);
       inkSoft = hslToHex(h + 200, 0.16, 0.66);

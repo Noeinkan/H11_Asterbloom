@@ -2,6 +2,9 @@ import './style.css';
 import { Application } from 'pixi.js';
 import { GameAudio } from './game/audio/audio';
 import { createCrustMenu } from './game/hud/crustMenu';
+import { createDebugOverlay } from './game/hud/debugOverlay';
+import { createFactionPlate } from './game/hud/hudFactionPlate';
+import { createHudControls } from './game/hud/hudControls';
 import {
   CRUST_MENU_ASK,
   crustPlantActionLabel,
@@ -13,6 +16,7 @@ import {
   readReducedMotion,
   writeMuted,
 } from './game/hud/prefs';
+import { PerfProbe } from './game/hud/perfProbe';
 import { createSessionHud } from './game/hud/sessionHud';
 import { createTitleHud } from './game/hud/titleHud';
 import { bindCameraControls } from './game/input/cameraControls';
@@ -36,6 +40,7 @@ import { Camera } from './game/render/camera';
 import { GraphView } from './game/render/graphView';
 import {
   applySceneToDocument,
+  bucketHue,
   createScenePalette,
   sceneAtTime,
   themeAt,
@@ -75,6 +80,89 @@ import { countOrbitingKind, createEmptyWorld, tick } from './game/sim/world';
 const SIM_DT = 1 / 60;
 const FPS_SAMPLE_MS = 500;
 const DEFAULT_SESSION_SEED = 0xc0a1f00d;
+
+/**
+ * How many queued rock / tree repaints a single frame is allowed to run.
+ * A palette step dirties every view at once; draining a couple per frame
+ * turns one 12-rock stall into a repaint that finishes well inside the
+ * ~30 frames before the next step, with no visible lag.
+ */
+const ROCK_REPAINTS_PER_FRAME = 2;
+const TREE_REPAINTS_PER_FRAME = 2;
+
+/**
+ * Backbuffer scale. Soft rocks, washes and gradients are fill-rate bound, so
+ * every device pixel costs real time: at DPR 2 we shade four times the
+ * fragments of DPR 1 for the same picture. 1.5 keeps edges clean on HiDPI
+ * screens; `LOW_RESOLUTION` is where we land if the frame budget says the
+ * GPU still can't keep up.
+ */
+const MAX_RESOLUTION = 1.5;
+const LOW_RESOLUTION = 1;
+/** Sustained FPS below this (over ~2 s) drops the backbuffer one step. */
+const DEGRADE_FPS = 45;
+const DEGRADE_SAMPLES = 4;
+
+/**
+ * Lightweight DOM tooltip that follows the cursor and shows the resource
+ * kind + remaining amount for a hovered pocket. Always present in the DOM;
+ * toggled via `data-visible` so it doesn't fight render order.
+ */
+interface PocketTooltip {
+  show(
+    screenX: number,
+    screenY: number,
+    payload: {
+      kind: 'mineral' | 'water' | 'energy';
+      amount: number;
+      maxAmount: number;
+    },
+  ): void;
+  hide(): void;
+  destroy(): void;
+}
+
+function createPocketTooltip(host: HTMLElement): PocketTooltip {
+  const root = document.createElement('div');
+  root.className = 'hud-pocket-tip';
+  root.dataset.visible = 'false';
+  root.innerHTML =
+    '<span class="hud-pocket-tip-kind"></span>' +
+    '<span class="hud-pocket-tip-stock"></span>' +
+    '<span class="hud-pocket-tip-bar"><span class="hud-pocket-tip-bar-fill"></span></span>';
+  host.appendChild(root);
+  const kindEl = root.querySelector<HTMLElement>('.hud-pocket-tip-kind')!;
+  const stockEl = root.querySelector<HTMLElement>('.hud-pocket-tip-stock')!;
+  const fillEl = root.querySelector<HTMLElement>('.hud-pocket-tip-bar-fill')!;
+  const KIND_LABEL: Record<'mineral' | 'water' | 'energy', string> = {
+    mineral: 'Mineral',
+    water: 'Water',
+    energy: 'Energy',
+  };
+  const KIND_COLOR: Record<'mineral' | 'water' | 'energy', string> = {
+    mineral: '#c89464',
+    water: '#84c4d8',
+    energy: '#e8c46f',
+  };
+  return {
+    show(screenX, screenY, payload) {
+      kindEl.textContent = KIND_LABEL[payload.kind];
+      const fill = payload.maxAmount > 0 ? payload.amount / payload.maxAmount : 0;
+      stockEl.textContent = `${payload.amount.toFixed(1)} / ${payload.maxAmount.toFixed(1)}`;
+      fillEl.style.width = `${Math.min(100, fill * 100).toFixed(1)}%`;
+      fillEl.style.background = KIND_COLOR[payload.kind];
+      root.style.left = `${screenX}px`;
+      root.style.top = `${screenY}px`;
+      root.dataset.visible = 'true';
+    },
+    hide() {
+      root.dataset.visible = 'false';
+    },
+    destroy() {
+      root.remove();
+    },
+  };
+}
 
 function rockOnScreen(
   x: number,
@@ -230,7 +318,7 @@ async function boot(): Promise<void> {
   applySceneToDocument(scene);
 
   const app = new Application();
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const dpr = Math.min(window.devicePixelRatio || 1, MAX_RESOLUTION);
   await app.init({
     resizeTo: window,
     antialias: true,
@@ -290,12 +378,19 @@ async function boot(): Promise<void> {
   let acc = 0;
   let palTime = 0;
   let hudAcc = 0;
+  let debugAcc = 0;
   let lastHudKey = '';
   let combatSnap = fillCombatSnap(world, emptyCombatSnap());
   let combatSnapB = emptyCombatSnap();
   let lastHueKey = -1;
+  let lastPaletteKey = '';
+  /** Views whose colors are stale, drained a few per frame while on screen. */
+  const rockRepaints = new Set<number>();
+  const treeRepaints = new Set<number>();
   let fpsSampleStarted = performance.now();
   let fpsSampleFrames = 0;
+  let slowSamples = 0;
+  const perf = new PerfProbe();
 
   const canAct = () =>
     sessionMode === 'playing' &&
@@ -307,6 +402,10 @@ async function boot(): Promise<void> {
   let titleHud!: ReturnType<typeof createTitleHud>;
   let pauseHud!: ReturnType<typeof createPauseHud>;
   let crustMenu!: ReturnType<typeof createCrustMenu>;
+  let debugOverlay!: ReturnType<typeof createDebugOverlay>;
+  let factionPlate!: ReturnType<typeof createFactionPlate>;
+  let hudControls!: ReturnType<typeof createHudControls>;
+  let pocketTip: PocketTooltip | null = null;
 
   const syncMuteLabel = () => {
     const muted = !audio.isEnabled();
@@ -323,6 +422,7 @@ async function boot(): Promise<void> {
   const resumeMatch = () => {
     paused = false;
     pauseHud.hide();
+    hudControls.setPauseActive(false);
   };
 
   const pauseMatch = () => {
@@ -330,6 +430,7 @@ async function boot(): Promise<void> {
     preview.hide();
     crustMenu.hide();
     pauseHud.show({ showNewMap: playMode === 'skirmish' });
+    hudControls.setPauseActive(true);
   };
 
   const setFollowSend = (enabled: boolean) => {
@@ -372,6 +473,8 @@ async function boot(): Promise<void> {
     asteroidViews.clear();
     for (const view of treeViews.values()) view.destroy();
     treeViews.clear();
+    rockRepaints.clear();
+    treeRepaints.clear();
     if (seedlings) {
       camera.world.removeChild(seedlings.back, seedlings.front);
       seedlings.destroy();
@@ -475,10 +578,15 @@ async function boot(): Promise<void> {
     palTime = 0;
     combatSnap = fillCombatSnap(world, combatSnap);
     lastHueKey = Math.round(scene.hue);
+    lastPaletteKey = '';
     pauseHud.hide();
     sessionHud.hideEnd();
     sessionHud.setVisible(true);
     titleHud.hide();
+    factionPlate.setVisible(true);
+    hudControls.setVisible(true);
+    hudControls.setPauseActive(false);
+    factionPlate.sync(world, gameplay.selectedAsteroidId);
   };
 
   const startSkirmish = (difficulty: Difficulty, seed?: number) => {
@@ -510,6 +618,7 @@ async function boot(): Promise<void> {
       return;
     }
     clearWorldViews();
+    debugOverlay.setVisible(false);
     sessionMode = 'title';
     status = 'playing';
     paused = false;
@@ -520,6 +629,10 @@ async function boot(): Promise<void> {
     sessionHud.setVisible(false);
     sessionHud.dismissFirstRun();
     titleHud.show();
+    factionPlate.setVisible(false);
+    hudControls.setVisible(false);
+    hudControls.setPauseActive(false);
+    hudControls.setHelpActive(false);
   };
 
   sessionHud = createSessionHud({
@@ -543,6 +656,16 @@ async function boot(): Promise<void> {
       const max = countFactionOrbiting(world, id, 'player');
       gameplay.sendMode = 'scout';
       gameplay.sendCount = resolveSendCount(max, 'scout', 1);
+    },
+    onSendPrecise: () => {
+      if (!canAct()) return;
+      const id = gameplay.selectedAsteroidId;
+      if (id === null) return;
+      const max = countFactionOrbiting(world, id, 'player');
+      // Enter precise mode with half of available as a friendly default —
+      // the player then dials around the target to fine-tune.
+      gameplay.sendMode = 'precise';
+      gameplay.sendCount = Math.min(max, Math.max(1, Math.ceil(max / 2)));
     },
     onSendAll: () => {
       if (!canAct()) return;
@@ -605,6 +728,27 @@ async function boot(): Promise<void> {
     },
   });
 
+  debugOverlay = createDebugOverlay(host);
+  pocketTip = createPocketTooltip(host);
+
+  factionPlate = createFactionPlate(host, sessionHud.root.querySelector('.hud-bar'));
+  hudControls = createHudControls({
+    host,
+    onPause: () => {
+      if (sessionMode !== 'playing') return;
+      if (pauseHud.isVisible()) resumeMatch();
+      else pauseMatch();
+    },
+    onHelp: () => {
+      if (sessionMode !== 'playing') return;
+      sessionHud.maybeShowFirstRun();
+      if (sessionHud.isFirstRunVisible()) {
+        firstRunBlocking = true;
+        hudControls.setHelpActive(true);
+      }
+    },
+  });
+
   camera.world.sortableChildren = true;
   starfield.root.zIndex = 0;
   graphView.root.zIndex = 1;
@@ -623,6 +767,54 @@ async function boot(): Promise<void> {
 
   syncMuteLabel();
   pauseHud.setFollowSend(followSendEnabled);
+
+  // Pocket tooltip — separate pointermove so we don't interfere with the
+  // gameplay click handler. Runs in capture phase so we can react even when
+  // gameplay already received the event.
+  const onPocketHover = (e: PointerEvent) => {
+    if (!pocketTip) return;
+    if (sessionMode !== 'playing') {
+      pocketTip.hide();
+      return;
+    }
+    const rect = app.canvas.getBoundingClientRect();
+    const screenX = e.clientX - rect.left;
+    const screenY = e.clientY - rect.top;
+    const w = camera.screenToWorld(screenX, screenY);
+    let hit: { pocketId: number; asteroidId: number } | null = null;
+    for (const view of asteroidViews.values()) {
+      const found = view.pickPocket(w.x, w.y);
+      if (found) {
+        hit = found;
+        break;
+      }
+    }
+    if (!hit) {
+      pocketTip.hide();
+      return;
+    }
+    const a = world.asteroids.get(hit.asteroidId);
+    if (!a) {
+      pocketTip.hide();
+      return;
+    }
+    const p = a.pockets.find((pk) => pk.id === hit!.pocketId);
+    if (!p) {
+      pocketTip.hide();
+      return;
+    }
+    // Position the tooltip relative to the viewport; the CSS centers
+    // horizontally and lifts above the cursor, so just feed it the
+    // local-coords top-left.
+    pocketTip.show(e.clientX, e.clientY, {
+      kind: p.kind,
+      amount: p.amount,
+      maxAmount: p.maxAmount,
+    });
+  };
+  app.canvas.addEventListener('pointermove', onPocketHover);
+  app.canvas.addEventListener('pointerleave', () => pocketTip?.hide());
+
   if (isFieldBoot()) {
     startSkirmish('normal', parseSeedFromHash() ?? DEFAULT_SESSION_SEED);
   } else {
@@ -643,6 +835,13 @@ async function boot(): Promise<void> {
       return;
     }
     if (sessionMode !== 'playing') return;
+    if (e.code === 'F3') {
+      e.preventDefault();
+      if (e.repeat) return;
+      debugOverlay.setVisible(!debugOverlay.isVisible());
+      if (debugOverlay.isVisible()) debugOverlay.sync(world, perf);
+      return;
+    }
     if (e.code === 'KeyF' && !e.repeat) {
       setFollowSend(!followSendEnabled);
       return;
@@ -672,13 +871,33 @@ async function boot(): Promise<void> {
 
   app.ticker.add((ticker) => {
     const frameDt = Math.min(0.05, ticker.deltaMS / 1000);
+    perf.beginFrame(ticker.deltaMS);
     fpsSampleFrames += 1;
     const fpsNow = performance.now();
     const fpsElapsed = fpsNow - fpsSampleStarted;
     if (fpsElapsed >= FPS_SAMPLE_MS) {
-      sessionHud.setFps((fpsSampleFrames * 1000) / fpsElapsed);
+      const fps = (fpsSampleFrames * 1000) / fpsElapsed;
+      sessionHud.setFps(fps);
       fpsSampleFrames = 0;
       fpsSampleStarted = fpsNow;
+      // Adaptive backbuffer: when the frame keeps missing its budget *and*
+      // the JavaScript finishes in well under half of it, we are shading
+      // more pixels than this GPU can afford. Step the resolution down once
+      // — the art is soft-edged, so the loss is barely visible, and every
+      // wash and gradient gets proportionally cheaper.
+      const stalling =
+        sessionMode === 'playing' && fps < DEGRADE_FPS && perf.gpuBound();
+      slowSamples = stalling ? slowSamples + 1 : 0;
+      if (slowSamples >= DEGRADE_SAMPLES) {
+        slowSamples = 0;
+        if (app.renderer.resolution > LOW_RESOLUTION) {
+          app.renderer.resize(
+            app.screen.width,
+            app.screen.height,
+            LOW_RESOLUTION,
+          );
+        }
+      }
     }
     cameraInput.tick(frameDt);
     palTime += frameDt;
@@ -690,6 +909,7 @@ async function boot(): Promise<void> {
       status === 'playing'
     ) {
       acc += frameDt;
+      perf.start('sim');
       while (acc >= SIM_DT) {
         const before = combatSnap;
         tick(world, SIM_DT);
@@ -699,6 +919,7 @@ async function boot(): Promise<void> {
         combatSnapB = before;
         acc -= SIM_DT;
       }
+      perf.stop();
       const next = matchStatus(world, matchConfig, matchRuntime);
       if (next !== 'playing') {
         status = next;
@@ -728,6 +949,7 @@ async function boot(): Promise<void> {
     if (sessionMode !== 'playing') {
       starfield.setParallax(camera.x, camera.y);
       starfield.tick(ticker.lastTime * 0.001);
+      perf.endFrame();
       return;
     }
 
@@ -746,46 +968,35 @@ async function boot(): Promise<void> {
       else treesByRock.set(tree.asteroidId, [tree]);
     }
 
-    // Scene writes happen every frame so the hue drift is continuous. Each
-// view caches a 1° hue bucket and skips Graphics work unless its bucket
-// changed — so the visible cost is ~360 repaints per cycle, not 60 per
-// second. The only throttled path is audio.setAtmosphere (per integer
-// hue), because the audio env crossfade doesn't need 60 Hz updates.
-writeScene(scene, sceneAtTime(world.seed, palTime));
-{
-  const hueKey = Math.round(scene.hue);
-  if (hueKey !== lastHueKey) {
-    lastHueKey = hueKey;
-    audio.setAtmosphere(scene.hue, scene.dark);
-  }
-}
-applySceneToDocument(scene);
-app.renderer.background.color = scene.bg;
-{
-  const themes = themeAt(world.seed, palTime);
-  starfield.retheme(scene, themes.themeA, themes.themeB, themes.mix);
-}
-seedlings?.retheme(scene);
-preview.retheme();
-graphView.retheme(scene);
-for (const a of world.asteroids.values()) {
-  const view = asteroidViews.get(a.id);
-  if (!view) continue;
-  view.retheme(
-    a,
-    scene,
-    a.id === gameplay.selectedAsteroidId,
-    EMPTY_PLANTABLE,
-    treesByRock.get(a.id),
-  );
-}
-for (const [id, view] of treeViews) {
-  const tree = world.trees.get(id);
-  if (!tree) continue;
-  const asteroid = world.asteroids.get(tree.asteroidId);
-  if (!asteroid) continue;
-  view.retheme(tree, asteroid, scene);
-}
+    // The scene hue drifts continuously, but a repaint only earns its keep
+    // when the 1° hue bucket (or the theme crossfade) actually moves —
+    // roughly twice a second. Everything below used to run every frame, and
+    // most of it was pure overhead at 60 Hz: a Text style write per rock
+    // (which re-rasterizes the label), seven CSS custom properties on :root
+    // (which invalidates the whole HUD's style), plus a retheme call per
+    // view. Gate the lot on the palette key, then hand the per-view repaints
+    // to a queue so one bucket step never repaints the field in one frame.
+    perf.start('palette');
+    writeScene(scene, sceneAtTime(world.seed, palTime));
+    const themes = themeAt(world.seed, palTime);
+    const paletteKey = `${bucketHue(scene.hue)}|${themes.themeA}|${themes.themeB}|${Math.round(themes.mix * 32)}`;
+    if (paletteKey !== lastPaletteKey) {
+      lastPaletteKey = paletteKey;
+      const hueKey = Math.round(scene.hue);
+      if (hueKey !== lastHueKey) {
+        lastHueKey = hueKey;
+        audio.setAtmosphere(scene.hue, scene.dark);
+      }
+      applySceneToDocument(scene);
+      app.renderer.background.color = scene.bg;
+      starfield.retheme(scene, themes.themeA, themes.themeB, themes.mix);
+      seedlings?.retheme(scene);
+      preview.retheme();
+      graphView.retheme(scene);
+      for (const id of asteroidViews.keys()) rockRepaints.add(id);
+      for (const id of treeViews.keys()) treeRepaints.add(id);
+    }
+    perf.stop();
 
     for (const a of world.asteroids.values()) {
       const prev = lastOwners.get(a.id);
@@ -799,6 +1010,8 @@ for (const [id, view] of treeViews) {
 
     const viewW = app.screen.width;
     const viewH = app.screen.height;
+    perf.start('rocks');
+    let rockBudget = ROCK_REPAINTS_PER_FRAME;
     for (const a of world.asteroids.values()) {
       const view = asteroidViews.get(a.id);
       if (!view) continue;
@@ -813,17 +1026,23 @@ for (const [id, view] of treeViews) {
         viewH,
       );
       view.root.visible = on;
+      // Off-screen rocks stay queued: nobody can see their stale colors, and
+      // they repaint on the frame they scroll back in.
       if (!on) continue;
-      view.update(
-        a,
-        a.id === gameplay.selectedAsteroidId,
-        EMPTY_PLANTABLE,
-        treesByRock.get(a.id),
-      );
+      const selected = a.id === gameplay.selectedAsteroidId;
+      const localTrees = treesByRock.get(a.id);
+      if (rockBudget > 0 && rockRepaints.delete(a.id)) {
+        rockBudget -= 1;
+        view.retheme(a, scene, selected, EMPTY_PLANTABLE, localTrees);
+      }
+      view.update(a, selected, EMPTY_PLANTABLE, localTrees);
     }
+    perf.stop();
 
     const seedlingsArr = [...world.seedlings.values()];
 
+    perf.start('trees');
+    let treeBudget = TREE_REPAINTS_PER_FRAME;
     for (const [id, view] of treeViews) {
       const tree = world.trees.get(id);
       if (!tree) continue;
@@ -842,11 +1061,18 @@ for (const [id, view] of treeViews) {
       view.canopy.visible = on;
       view.roots.visible = on;
       if (!on) continue;
+      if (treeBudget > 0 && treeRepaints.delete(id)) {
+        treeBudget -= 1;
+        view.retheme(tree, asteroid, scene);
+      }
       view.update(tree, asteroid);
       view.setDepartingSeedlings(seedlingsArr, tree, asteroid);
     }
+    perf.stop();
 
+    perf.start('seedlings');
     seedlings?.sync(world.seedlings);
+    perf.stop();
 
     if (followingSend) {
       const center = travelCentroid(world, 'player');
@@ -873,6 +1099,7 @@ for (const [id, view] of treeViews) {
       ? countOrbitingKind(world, selId, 'player', 'sentinel')
       : 0;
     hudAcc += frameDt;
+    perf.start('hud');
     const hudKey = `${selId}:${gameplay.dragging}:${gameplay.plantKind}:${gameplay.sendMode}:${gameplay.sendCount}:${local}`;
     if (hudAcc >= 0.12 || hudKey !== lastHudKey) {
       hudAcc = 0;
@@ -887,7 +1114,18 @@ for (const [id, view] of treeViews) {
         gameplay.sendCount,
         gameplay.sendMode,
       );
+      factionPlate.sync(world, selId);
+      if (!sessionHud.isFirstRunVisible()) hudControls.setHelpActive(false);
+      if (debugOverlay.isVisible()) {
+        debugAcc += frameDt;
+        if (debugAcc >= 0.25) {
+          debugAcc = 0;
+          debugOverlay.sync(world, perf);
+        }
+      }
     }
+    perf.stop();
+    perf.endFrame();
   });
 }
 

@@ -61,6 +61,7 @@ export function createSessionHud(opts: {
   onPlantKind: (kind: TreeKind) => void;
   onMuteToggle: () => void;
   onSendScout: () => void;
+  onSendPrecise: () => void;
   onSendAll: () => void;
   onSendBump: (delta: number) => void;
   onFirstRunDismiss: () => void;
@@ -92,6 +93,7 @@ export function createSessionHud(opts: {
         </div>
         <div class="hud-send" id="hud-send" role="group" aria-label="Send count">
           <button type="button" class="hud-send-btn" id="hud-send-scout" data-mode="scout">Scout</button>
+          <button type="button" class="hud-send-btn" id="hud-send-precise" data-mode="precise" title="Dial a precise number around the target">Precise</button>
           <button type="button" class="hud-send-btn" id="hud-send-dec" aria-label="Fewer seedlings">−</button>
           <span class="hud-send-count" id="hud-send-count">0</span>
           <button type="button" class="hud-send-btn" id="hud-send-inc" aria-label="More seedlings">+</button>
@@ -154,6 +156,7 @@ export function createSessionHud(opts: {
   ];
   const sendScoutBtn = hud.querySelector<HTMLButtonElement>('#hud-send-scout')!;
   const sendAllBtn = hud.querySelector<HTMLButtonElement>('#hud-send-all')!;
+  const sendPreciseBtn = hud.querySelector<HTMLButtonElement>('#hud-send-precise')!;
   const sendDecBtn = hud.querySelector<HTMLButtonElement>('#hud-send-dec')!;
   const sendIncBtn = hud.querySelector<HTMLButtonElement>('#hud-send-inc')!;
   const sendCountEl = hud.querySelector('#hud-send-count')!;
@@ -185,6 +188,10 @@ export function createSessionHud(opts: {
     sendCountEl.textContent = String(count);
     sendScoutBtn.classList.toggle('is-selected', mode === 'scout');
     sendAllBtn.classList.toggle('is-selected', mode === 'all');
+    sendPreciseBtn.classList.toggle('is-selected', mode === 'precise');
+    // The count chip carries the precise value too, so the player can see
+    // the exact dialed number even when their cursor is offscreen.
+    sendCountEl.classList.toggle('is-precise', mode === 'precise');
   };
 
   const setStatRows = (
@@ -227,6 +234,7 @@ export function createSessionHud(opts: {
   endTitle.addEventListener('click', () => opts.onTitle?.());
   sendScoutBtn.addEventListener('click', () => opts.onSendScout());
   sendAllBtn.addEventListener('click', () => opts.onSendAll());
+  sendPreciseBtn.addEventListener('click', () => opts.onSendPrecise());
   sendDecBtn.addEventListener('click', () => opts.onSendBump(-1));
   sendIncBtn.addEventListener('click', () => opts.onSendBump(1));
   gotIt.addEventListener('click', () => {

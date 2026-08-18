@@ -32,6 +32,13 @@ import {
   ROOT_FEED_GROWTH_BONUS,
   CORE_ENERGY_PER_INTAKE,
   CORE_FEED_DRAIN,
+  DIET_GROWTH_RATE,
+  DIET_GROWTH_WEIGHT,
+  DIET_INTAKE_FLOOR,
+  DIET_SENTINEL_BIAS,
+  DIET_SPAWN_BOOST,
+  DIET_STAT_GAIN,
+  dietaryBias,
   ROOT_INTAKE_FALLOFF,
   SENTINEL_SPAWN_ENERGY,
   SENTINEL_STARVE_DPS,
@@ -498,6 +505,39 @@ function makeSeedling(
   return seedling;
 }
 
+/**
+ * Pick a seedling kind from a tree's dietary bias. The legacy rule kept
+ * energy trees as the only sentinel source; with the bias loop enabled a
+ * tree that strongly latches onto energy pockets (dominant share above
+ * DIET_SENTINEL_BIAS) also drops sentinels so the resource actually
+ * shapes the colony instead of just sitting in the reservoir.
+ */
+function pickSeedlingKind(tree: Tree, _asteroid: Asteroid): SeedlingKind {
+  if (tree.kind === 'energy') return 'sentinel';
+  const bias = tree.dietaryBias;
+  if (bias && bias.energy >= DIET_SENTINEL_BIAS) return 'sentinel';
+  return 'basic';
+}
+
+/**
+ * Shift asteroid stats by the tree's dietary bias. Mineral-heavy bias
+ * thickens the colony (strength); water-heavy bias tops up resilience
+ * (energy / hp); energy-heavy bias makes it lighter on its feet (speed).
+ *
+ * The shift is symmetric: each bias component is multiplied by
+ * DIET_STAT_GAIN so the per-stat delta is bounded by what the tree
+ * actually drew from the rock. Suns with no root system still produce
+ * baseline stats (bias = 0).
+ */
+function seedStatsFromDiet(base: Stats, bias: RootIntake | undefined): Stats {
+  const b = bias ?? { mineral: 0, water: 0, energy: 0 };
+  return {
+    strength: base.strength + b.mineral * DIET_STAT_GAIN,
+    energy: base.energy + b.water * DIET_STAT_GAIN,
+    speed: base.speed + b.energy * DIET_STAT_GAIN,
+  };
+}
+
 function spawnSeedling(world: World, tree: Tree, asteroid: Asteroid): void {
   const rng = mulberry32((world.seed ^ tree.id ^ (world.nextId * 9973)) >>> 0);
   const pos = plantPose(asteroid, tree.slotIndex, tree.plantAngle);
@@ -537,8 +577,8 @@ function spawnSeedling(world: World, tree: Tree, asteroid: Asteroid): void {
       : tips[Math.floor(rng() * tips.length)]!
   ) as { x: number; y: number; angle: number };
 
-  const kind: SeedlingKind = tree.kind === 'energy' ? 'sentinel' : 'basic';
-  const stats = { ...asteroid.stats };
+  const kind: SeedlingKind = pickSeedlingKind(tree, asteroid);
+  const stats = seedStatsFromDiet(asteroid.stats, tree.dietaryBias);
   const orbitSpeed = 0.28 + stats.speed / 560;
   const orbitAngle = Math.atan2(tip.y - asteroid.y, tip.x - asteroid.x);
   makeSeedling(world, asteroid, tree.faction, kind, {
@@ -929,7 +969,12 @@ function spawnInterval(tree: Tree, asteroid: Asteroid): number {
     0.55 + asteroid.minerals / 100 + (tree.rootIntake?.mineral ?? 0) * 0.03;
   const energyMul = 0.75 + asteroid.stats.energy / 280;
   const feedMul = 1 + ROOT_FEED_SPAWN_BONUS * rootFeedActive(tree.maturity, tree.coreFeed);
-  return base / (maturityMul * mineralMul * energyMul * feedMul);
+  // Energy-biased trees spawn faster: their intake is converted into youth
+  // churn, so a colony fed mainly by energy pockets reads as shallower,
+  // hungrier, and more responsive.
+  const dietSpawnMul =
+    1 + DIET_SPAWN_BOOST * (tree.dietaryBias?.energy ?? 0);
+  return base / (maturityMul * mineralMul * energyMul * feedMul * dietSpawnMul);
 }
 
 function tickEnergy(world: World, dt: number): void {
@@ -1100,7 +1145,22 @@ function tickTrees(world: World, dt: number): void {
             (asteroid.coreEnergy / asteroid.maxCoreEnergy) *
             dt
           : 0;
-      tree.maturity = Math.min(1, tree.maturity + base + fedBoost);
+      // Dietary bias: each pocket kind feeds a different growth vector,
+      // so a tree that latches onto richer pockets grows faster in a
+      // kind-specific way. Total intake below the floor = no bonus.
+      const intake = tree.rootIntake;
+      const intakeTotal =
+        (intake?.mineral ?? 0) + (intake?.water ?? 0) + (intake?.energy ?? 0);
+      tree.dietaryBias = dietaryBias(intake);
+      const dietBoost =
+        intakeTotal >= DIET_INTAKE_FLOOR
+          ? (tree.dietaryBias.mineral * DIET_GROWTH_WEIGHT.mineral +
+              tree.dietaryBias.water * DIET_GROWTH_WEIGHT.water +
+              tree.dietaryBias.energy * DIET_GROWTH_WEIGHT.energy) *
+            DIET_GROWTH_RATE *
+            dt
+          : 0;
+      tree.maturity = Math.min(1, tree.maturity + base + fedBoost + dietBoost);
     }
 
     if (tree.kind === 'defense') continue;

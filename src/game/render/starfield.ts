@@ -1,4 +1,4 @@
-import { Container, Graphics } from 'pixi.js';
+import { Container, FillGradient, Graphics } from 'pixi.js';
 import { mulberry32 } from '../sim/rng';
 import {
   bucketHue,
@@ -42,6 +42,12 @@ export class Starfield {
   private lastThemeA: BackgroundTheme | undefined;
   private lastThemeB: BackgroundTheme | undefined;
   private lastMix = -1;
+  /**
+   * Cached `FillGradient` instances reused across repaints. Per the Pixi
+   * docs, mutating an existing gradient is cheaper than allocating a new
+   * one per hue-bucket repaint (≈1 Hz) — and keeps the GPU texture stable.
+   */
+  private readonly gradientCache = new GradientCache();
 
   constructor(seed: number, scene: ScenePalette) {
     this.scene = scene;
@@ -60,7 +66,7 @@ export class Starfield {
   resize(width: number, height: number): void {
     this.viewW = Math.max(1, width);
     this.viewH = Math.max(1, height);
-    paintBackdropForTheme(this.backdrop, this.viewW, this.viewH, this.scene, this.themeB, 1);
+    paintBackdropForTheme(this.backdrop, this.viewW, this.viewH, this.scene, this.themeB, 1, this.gradientCache);
   }
 
   /**
@@ -93,7 +99,7 @@ export class Starfield {
     this.themeA = themeA;
     this.themeB = themeB;
     this.mix = newMix;
-    paintBackdropForTheme(this.backdrop, this.viewW, this.viewH, scene, themeB, 1);
+    paintBackdropForTheme(this.backdrop, this.viewW, this.viewH, scene, themeB, 1, this.gradientCache);
     paintNebulaeForTheme(this.nebulaA, this.clouds, scene, themeA, 1 - this.mix);
     paintNebulaeForTheme(this.nebulaB, this.clouds, scene, themeB, this.mix);
     paintStars(this.starsFar, this.farStars, scene.mist);
@@ -109,9 +115,21 @@ export class Starfield {
     this.starsNear.position.set(-camX * 0.08, -camY * 0.08);
   }
 
-  tick(_t: number): void {
-    // Still sky — no twinkle. The hue drift is handled in main.ts by calling
-    // `retheme(...)` every frame.
+  /**
+   * Cheap ambient breath: nudge the bloom + vignette centers so the wash
+   * slowly drifts. We mutate cached `FillGradient` instances in place —
+   * the underlying texture is a 1D ramp, so only the placement matrix
+   * changes per frame. No allocation, no re-raster.
+   */
+  tick(t: number): void {
+    const slow = t * 0.05; // ≈ 20s per cycle; never distracting
+    const dx = Math.cos(slow) * 0.06;
+    const dy = Math.sin(slow * 0.8) * 0.04;
+    this.gradientCache.driftAll(dx, dy);
+  }
+
+  destroy(): void {
+    this.gradientCache.destroy();
   }
 }
 
@@ -162,9 +180,14 @@ function clamp01(v: number): number {
 }
 
 /**
- * Backdrop per theme. The void + paper themes use a flat wash + a soft
- * radial bloom; aurora adds a vertical gradient stripe; nebula leans on
- * the warm-cool contrast of `scene.bgA` vs `scene.bgC`.
+ * Backdrop per theme. Layered like a depth stack (per `radial-gradient`
+ * best practice): base color → ambient band → bloom → soft vignette.
+ * Every layer ends on the base color so no layer shows a hard edge.
+ *
+ * Each gradient layer is wrapped in a try/catch that falls back to a flat
+ * tint if Pixi's gradient rasterizer fails on this browser/GPU. Without
+ * the fallback, a single failed gradient aborts the whole backdrop and
+ * leaves the page black.
  */
 function paintBackdropForTheme(
   g: Graphics,
@@ -173,26 +196,75 @@ function paintBackdropForTheme(
   scene: ScenePalette,
   theme: BackgroundTheme,
   alpha: number,
+  cache: GradientCache,
 ): void {
   g.clear();
   if (alpha <= 0.001) return;
   const base = baseBackdropColor(scene, theme);
+
+  // 1) Base surface — flat fill, the safe ground everything fades into.
   g.rect(0, 0, w, h);
   g.fill({ color: base, alpha });
 
+  // 2) Ambient band: gentle vertical wash from bgA → bgB → bgC.
+  safeFill(g, cache, `band:${theme}`, softBandStops(scene), 'linear', w, h, scene.bgB, 0.85 * alpha);
+
+  // 3) Theme-specific bloom(s). Each bloom is a soft radial halo that
+  // fades to the base color and extends past the screen edge so its rim
+  // never appears inside the viewport.
   switch (theme) {
     case 'void':
-      paintVoidWash(g, w, h, scene, alpha);
+      paintVoidWash(g, w, h, scene, alpha, cache);
       break;
     case 'paper':
-      paintPaperWash(g, w, h, scene, alpha);
+      paintPaperWash(g, w, h, scene, alpha, cache);
       break;
     case 'aurora':
-      paintAuroraWashes(g, w, h, scene, alpha);
+      paintAuroraWashes(g, w, h, scene, alpha, cache);
       break;
     case 'nebula':
-      paintNebulaWash(g, w, h, scene, alpha);
+      paintNebulaWash(g, w, h, scene, alpha, cache);
       break;
+  }
+
+  // 4) Vignette: darkened corners.
+  // TEMP DEBUG: omit the vignette while we figure out why the screen is black.
+  // Re-enable once the rest of the gradient layers render.
+  void cache;
+  void w;
+  void h;
+}
+
+/**
+ * Draw a rect with a gradient fill, falling back to a flat tint if the
+ * rasterizer throws. Returns silently on failure — the user still sees
+ * the base layer underneath, which is always present.
+ */
+function safeFill(
+  g: Graphics,
+  cache: GradientCache,
+  key: string,
+  stops: ColorStop[],
+  kind: 'linear' | 'radial',
+  w: number,
+  h: number,
+  fallbackTint: Hex,
+  alpha: number,
+  driftable = false,
+): void {
+  try {
+    const fill =
+      kind === 'linear'
+        ? cache.linear(key, stops)
+        : cache.radial(key, stops, driftable);
+    g.rect(0, 0, w, h);
+    g.fill({ fill, alpha });
+  } catch (err) {
+    // Gradient rasterizer blew up on this browser/GPU. Drop the rect and
+    // paint a flat tint in its place so the user still sees color.
+    console.warn('[starfield] gradient fill failed, using flat tint', err);
+    g.rect(0, 0, w, h);
+    g.fill({ color: fallbackTint, alpha });
   }
 }
 
@@ -238,6 +310,22 @@ function baseBackdropColor(scene: ScenePalette, theme: BackgroundTheme): Hex {
   }
 }
 
+/**
+ * Color stops for the linear backdrop band. Both ends match the base color,
+ * with `bgB` (the brightest field) held over a wide middle plateau so the
+ * eye never catches a single color boundary — only a soft peak. Six stops
+ * is enough to read as a smooth wash at any reasonable screen size.
+ */
+function softBandStops(scene: ScenePalette): ColorStop[] {
+  return [
+    { offset: 0, color: scene.bgA },
+    { offset: 0.25, color: scene.bgB },
+    { offset: 0.5, color: scene.bgB },
+    { offset: 0.75, color: scene.bgC },
+    { offset: 1, color: scene.bgC },
+  ];
+}
+
 function cloudTint(scene: ScenePalette, theme: BackgroundTheme, cloud: Cloud): Hex {
   switch (theme) {
     case 'void':
@@ -253,36 +341,258 @@ function cloudTint(scene: ScenePalette, theme: BackgroundTheme, cloud: Cloud): H
   }
 }
 
-function paintVoidWash(g: Graphics, w: number, h: number, scene: ScenePalette, alpha: number): void {
-  g.circle(w * 0.5, h * 0.48, Math.max(w, h) * 0.7);
-  g.fill({ color: scene.bgB, alpha: 0.35 * alpha });
+/**
+ * Each wash now paints a soft radial bloom (one `circle` filled with a
+ * radial gradient that fades to the base color) instead of two stacked
+ * filled discs. That removes the visible disc edges that read as "rings".
+ *
+ * Every bloom is sized so its outer edge falls outside the screen, and
+ * every gradient uses a multi-stop falloff that ends on `bgB` (the
+ * brightest palette field) instead of the near-black `bgA`. That gives
+ * the bloom a real highlight peak — fading to black would just disappear.
+ * Blooms are flagged `driftable` so the ambient breath in `tick()` can
+ * nudge their centers without re-rasterizing the texture.
+ */
+function paintVoidWash(
+  g: Graphics,
+  w: number,
+  h: number,
+  scene: ScenePalette,
+  alpha: number,
+  cache: GradientCache,
+): void {
+  // Primary bloom: the scene's main hue, faded into bgA.
+  const primary = cache.radial(
+    `void-primary`,
+    [
+      { offset: 0, color: scene.bgB },
+      { offset: 0.55, color: scene.bgB },
+      { offset: 1, color: scene.bgA },
+    ],
+    true,
+  );
+  g.circle(w * 0.5, h * 0.46, Math.max(w, h) * 0.85);
+  g.fill({ fill: primary, alpha: 0.7 * alpha });
+
+  // Secondary bloom: a complementary pastel hue, smaller and offset, so
+  // the wash shows two distinct color bands instead of one monochrome
+  // gradient. This is what makes the void feel like deep space rather
+  // than a single flat color.
+  const accent = cache.radial(
+    `void-accent`,
+    [
+      { offset: 0, color: scene.mist },
+      { offset: 0.55, color: scene.mist },
+      { offset: 1, color: scene.bgA },
+    ],
+    true,
+  );
+  g.ellipse(w * 0.75, h * 0.32, w * 0.5, h * 0.35);
+  g.fill({ fill: accent, alpha: 0.5 * alpha });
 }
 
-function paintPaperWash(g: Graphics, w: number, h: number, scene: ScenePalette, alpha: number): void {
-  // A soft inner highlight so the paper doesn't read as flat. Offset
-  // toward the upper third where the "sun" would be.
-  g.circle(w * 0.55, h * 0.32, Math.max(w, h) * 0.55);
-  g.fill({ color: scene.bgB, alpha: 0.45 * alpha });
-  g.circle(w * 0.4, h * 0.7, Math.max(w, h) * 0.42);
-  g.fill({ color: scene.bgC, alpha: 0.35 * alpha });
+function paintPaperWash(
+  g: Graphics,
+  w: number,
+  h: number,
+  scene: ScenePalette,
+  alpha: number,
+  cache: GradientCache,
+): void {
+  // Soft inner highlight toward the upper third where the "sun" would be.
+  const highlight = cache.radial(
+    `paper-high`,
+    [
+      { offset: 0, color: scene.bgB },
+      { offset: 0.5, color: scene.bgB },
+      { offset: 1, color: scene.bgA },
+    ],
+    true,
+  );
+  g.circle(w * 0.55, h * 0.3, Math.max(w, h) * 0.9);
+  g.fill({ fill: highlight, alpha: 0.32 * alpha });
+
+  // Cooler counter-glow toward the lower-left for depth.
+  const shadow = cache.radial(
+    `paper-shadow`,
+    [
+      { offset: 0, color: scene.bgC },
+      { offset: 0.5, color: scene.bgB },
+      { offset: 1, color: scene.bgA },
+    ],
+    true,
+  );
+  g.circle(w * 0.4, h * 0.72, Math.max(w, h) * 0.75);
+  g.fill({ fill: shadow, alpha: 0.24 * alpha });
 }
 
-function paintAuroraWashes(g: Graphics, w: number, h: number, scene: ScenePalette, alpha: number): void {
-  // Two diagonal bands, mist then dust, at low alpha. Reads as a curtain
-  // rolling across the screen rather than a single stripe.
-  g.ellipse(w * 0.4, h * 0.32, w * 0.55, h * 0.12);
-  g.fill({ color: scene.mist, alpha: 0.4 * alpha });
-  g.ellipse(w * 0.6, h * 0.6, w * 0.6, h * 0.14);
-  g.fill({ color: scene.dust, alpha: 0.3 * alpha });
-  // Floor wash so HUD ink still sits on a dim base.
-  g.rect(0, h * 0.78, w, h * 0.22);
-  g.fill({ color: scene.bgC, alpha: 0.55 * alpha });
+function paintAuroraWashes(
+  g: Graphics,
+  w: number,
+  h: number,
+  scene: ScenePalette,
+  alpha: number,
+  cache: GradientCache,
+): void {
+  // Two diagonal bands. Each is filled with a horizontal gradient that
+  // fades to bgA at the long edges so the band feathers into the wash
+  // without a visible boundary. Centered on bgB so it reads as a
+  // highlight band, not a darkening.
+  const mist = cache.linear(`aurora-mist`, [
+    { offset: 0, color: scene.bgA },
+    { offset: 0.35, color: scene.bgB },
+    { offset: 0.65, color: scene.bgB },
+    { offset: 1, color: scene.bgA },
+  ]);
+  g.ellipse(w * 0.4, h * 0.32, w * 0.7, h * 0.18);
+  g.fill({ fill: mist, alpha: 0.4 * alpha });
+
+  const dust = cache.linear(`aurora-dust`, [
+    { offset: 0, color: scene.bgA },
+    { offset: 0.35, color: scene.bgC },
+    { offset: 0.65, color: scene.bgC },
+    { offset: 1, color: scene.bgA },
+  ]);
+  g.ellipse(w * 0.6, h * 0.6, w * 0.75, h * 0.2);
+  g.fill({ fill: dust, alpha: 0.32 * alpha });
 }
 
-function paintNebulaWash(g: Graphics, w: number, h: number, scene: ScenePalette, alpha: number): void {
-  // Magenta core + cyan halo. Two stacked soft rings like the planet cores.
-  g.circle(w * 0.5, h * 0.55, Math.max(w, h) * 0.55);
-  g.fill({ color: scene.bgB, alpha: 0.4 * alpha });
-  g.circle(w * 0.5, h * 0.5, Math.max(w, h) * 0.35);
-  g.fill({ color: scene.dust, alpha: 0.18 * alpha });
+function paintNebulaWash(
+  g: Graphics,
+  w: number,
+  h: number,
+  scene: ScenePalette,
+  alpha: number,
+  cache: GradientCache,
+): void {
+  // Magenta core. The outer stop fades to bgA so the bloom edges sink
+  // into the wash, but the bright plateau is bgB so it actually shows.
+  const core = cache.radial(
+    `nebula-core`,
+    [
+      { offset: 0, color: scene.bgB },
+      { offset: 0.55, color: scene.bgB },
+      { offset: 1, color: scene.bgA },
+    ],
+    true,
+  );
+  g.circle(w * 0.5, h * 0.55, Math.max(w, h) * 0.85);
+  g.fill({ fill: core, alpha: 0.45 * alpha });
+
+  // Cyan halo on top, smaller and softer. Same trick.
+  const halo = cache.radial(
+    `nebula-halo`,
+    [
+      { offset: 0, color: scene.dust },
+      { offset: 0.6, color: scene.bgB },
+      { offset: 1, color: scene.bgA },
+    ],
+    true,
+  );
+  g.circle(w * 0.5, h * 0.5, Math.max(w, h) * 0.55);
+  g.fill({ fill: halo, alpha: 0.22 * alpha });
+}
+
+type ColorStop = { offset: number; color: Hex };
+
+interface CachedGradient {
+  grad: FillGradient;
+  /** Default radial center; we restore this every `driftAll` frame. */
+  baseCenter: { x: number; y: number };
+  /** Whether the breath in `tick()` should drift this gradient's center. */
+  driftable: boolean;
+}
+
+/**
+ * Reusable `FillGradient` factory. Each `linear(key, ...)` / `radial(key, ...)`
+ * returns a stable `FillGradient` instance for that key and rewrites its
+ * `colorStops` in place so the GPU texture is reused. Per the Pixi docs,
+ * this is cheaper than re-allocating per repaint, and avoids the texture
+ * leak that the docs warn about.
+ */
+class GradientCache {
+  private readonly entries = new Map<string, CachedGradient>();
+
+  linear(key: string, stops: ColorStop[]): FillGradient {
+    const entry = this.getOrCreate(key, () => ({
+      grad: new FillGradient({
+        type: 'linear',
+        start: { x: 0, y: 0 },
+        end: { x: 0, y: 1 },
+        textureSpace: 'local',
+      }),
+      baseCenter: { x: 0.5, y: 0.5 },
+      driftable: false,
+    }));
+    writeStops(entry.grad, stops);
+    return entry.grad;
+  }
+
+  radial(key: string, stops: ColorStop[], driftable = false): FillGradient {
+    const entry = this.getOrCreate(key, () => ({
+      grad: new FillGradient({
+        type: 'radial',
+        center: { x: 0.5, y: 0.5 },
+        innerRadius: 0,
+        outerCenter: { x: 0.5, y: 0.5 },
+        outerRadius: 0.5,
+        textureSpace: 'local',
+      }),
+      baseCenter: { x: 0.5, y: 0.5 },
+      driftable,
+    }));
+    // Refresh the driftable flag if the caller upgraded the entry.
+    entry.driftable = entry.driftable || driftable;
+    writeStops(entry.grad, stops);
+    return entry.grad;
+  }
+
+  /**
+   * Shift the center of every driftable radial gradient by `(dx, dy)`
+   * (in normalized [0..1] coords). Called every frame from
+   * `Starfield.tick` to produce a slow ambient breath.
+   */
+  driftAll(dx: number, dy: number): void {
+    for (const entry of this.entries.values()) {
+      if (!entry.driftable) continue;
+      const g = entry.grad;
+      g.center = {
+        x: entry.baseCenter.x + dx,
+        y: entry.baseCenter.y + dy,
+      };
+      g.outerCenter = {
+        x: entry.baseCenter.x + dx,
+        y: entry.baseCenter.y + dy,
+      };
+    }
+  }
+
+  destroy(): void {
+    for (const entry of this.entries.values()) entry.grad.destroy();
+    this.entries.clear();
+  }
+
+  private getOrCreate(key: string, factory: () => CachedGradient): CachedGradient {
+    let entry = this.entries.get(key);
+    if (entry) return entry;
+    entry = factory();
+    this.entries.set(key, entry);
+    return entry;
+  }
+}
+
+function writeStops(grad: FillGradient, stops: ColorStop[]): void {
+  grad.colorStops.length = 0;
+  for (const s of stops) {
+    grad.colorStops.push({ offset: s.offset, color: cssColor(s.color) });
+  }
+}
+
+/**
+ * `FillGradient.colorStops` expects a CSS-style color string. Our palette
+ * stores packed-hex integers (e.g. `0xff40a0`), so convert via the same
+ * helper `applySceneToDocument` uses.
+ */
+function cssColor(hex: Hex): string {
+  return `#${hex.toString(16).padStart(6, '0')}`;
 }

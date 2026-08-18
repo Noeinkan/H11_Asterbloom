@@ -91,6 +91,8 @@ export interface Tree {
   coreFeed: number;
   /** Per-frame extraction from subsurface pockets (cached each tick). */
   rootIntake?: RootIntake;
+  /** Normalized (0..1) per-kind diet share derived from rootIntake. */
+  dietaryBias?: RootIntake;
   /** Baked world-space root-tip positions (static per tree, computed once). */
   rootTips?: { x: number; y: number }[];
 }
@@ -284,6 +286,62 @@ export const CORE_ENERGY_PER_INTAKE: Record<ResourceKind, number> = {
 };
 /** Modest maturity boost (per second, at full core) when the reservoir is fed. */
 export const ROOT_FEED_GROWTH_BONUS = 0.002;
+
+/**
+ * Dietary bias weights: how strongly each pocket kind nudges the tree's
+ * per-type growth, seed stats, and visual tint. Eufloria-inspired; the
+ * three resources map to ENERGY (gravitropism / height, fast spawning),
+ * STRENGTH (root thickness, attack), and SPEED (canopy, scout mobility).
+ */
+export const DIET_GROWTH_WEIGHT: Record<ResourceKind, number> = {
+  mineral: 0.8,
+  water: 0.5,
+  energy: 1.0,
+};
+/** Additive maturity boost per second at full bias for that kind. */
+export const DIET_GROWTH_RATE = 0.003;
+/** Seed stat gain per unit of normalized bias (0..1). Bounded hits. */
+export const DIET_STAT_GAIN = 0.45;
+/** Spawn-interval shrink per unit of normalized bias (faster spender). */
+export const DIET_SPAWN_BOOST = 0.18;
+/** Below this total intake the bias is treated as un-fed — no bonuses. */
+export const DIET_INTAKE_FLOOR = 0.05;
+/**
+ * Minimum normalized bias share to graduate a tree from basic to sentinel
+ * seedlings. The dominant bias has to exceed this for the kind to switch.
+ */
+export const DIET_SENTINEL_BIAS = 0.55;
+
+/**
+ * Normalize a per-kind root intake into a 0..1 weighted "diet" vector.
+ * The returned {mineral, water, energy} sums to 1 (when not all zero), so
+ * downstream code can mix tints, average stats, and pick a dominant kind
+ * without each caller re-deriving the share.
+ */
+export function dietaryBias(intake: RootIntake | undefined): RootIntake {
+  const m = intake?.mineral ?? 0;
+  const w = intake?.water ?? 0;
+  const e = intake?.energy ?? 0;
+  const d = m * DIET_GROWTH_WEIGHT.mineral + w * DIET_GROWTH_WEIGHT.water + e * DIET_GROWTH_WEIGHT.energy;
+  if (d < 1e-6) return { mineral: 0, water: 0, energy: 0 };
+  return {
+    mineral: (m * DIET_GROWTH_WEIGHT.mineral) / d,
+    water: (w * DIET_GROWTH_WEIGHT.water) / d,
+    energy: (e * DIET_GROWTH_WEIGHT.energy) / d,
+  };
+}
+
+/** Return the dominant kind (or null if intake is below the feed floor). */
+export function dominantDiet(intake: RootIntake | undefined): ResourceKind | null {
+  const bias = dietaryBias(intake);
+  const total = (intake?.mineral ?? 0) + (intake?.water ?? 0) + (intake?.energy ?? 0);
+  if (total < DIET_INTAKE_FLOOR) return null;
+  let best: ResourceKind = 'mineral';
+  let bestV = bias.mineral;
+  if (bias.water > bestV) { best = 'water'; bestV = bias.water; }
+  if (bias.energy > bestV) { best = 'energy'; bestV = bias.energy; }
+  return best;
+}
 export const COMBAT_RANGE = 28;
 export const BASIC_HP = 12;
 export const SENTINEL_HP = 34;

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  DIET_GROWTH_RATE,
   DYSON_GROWTH_SECONDS,
   POCKET_REGEN_PER_SEC,
   ROOT_FEED_GROWTH_BONUS,
@@ -79,9 +80,13 @@ describe('coreEnergy reservoir', () => {
     const base = (1 / DYSON_GROWTH_SECONDS) * 1;
     // Starved tree grows at exactly the base rate.
     expect(starved.tree.maturity).toBeCloseTo(base, 5);
-    // Fed tree grows faster thanks to the reservoir bonus.
+    // Fed tree grows faster thanks to the reservoir bonus; the dietary
+    // bias loop may add a small extra (magnitude <= DIET_GROWTH_RATE) so
+    // we leave headroom instead of asserting the legacy upper bound.
     expect(fed.tree.maturity).toBeGreaterThan(starved.tree.maturity);
-    expect(fed.tree.maturity).toBeLessThanOrEqual(base + ROOT_FEED_GROWTH_BONUS * 1 + 1e-6);
+    expect(fed.tree.maturity).toBeLessThanOrEqual(
+      base + ROOT_FEED_GROWTH_BONUS * 1 + DIET_GROWTH_RATE + 1e-6,
+    );
   });
 
   it('keeps the baked coreFeed while rootIntake is cached each tick', () => {

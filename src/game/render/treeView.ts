@@ -5,6 +5,7 @@ import {
   growTree,
   rootFeedActive,
   treeFlowersWorld,
+  type PocketTarget,
   type TreeGeom,
   type TreeStroke,
 } from '../sim/lsystem';
@@ -21,6 +22,7 @@ import {
   bucketHue,
   floraPalette,
   mixHex,
+  resourceKindHex,
   sapRiseU,
   sapStage,
   SAP_WINDOW,
@@ -247,7 +249,7 @@ export class TreeView {
 
   private adultGeom(tree: Tree, asteroid: Asteroid): TreeGeom {
     const polar = plantPose(asteroid, tree.slotIndex, tree.plantAngle);
-    const key = `${this.treeSeed}:${asteroid.radius}:${polar.dist.toFixed(2)}:${polar.surfaceY.toFixed(2)}:${this.kind}`;
+    const key = `${this.treeSeed}:${asteroid.radius}:${polar.dist.toFixed(2)}:${polar.surfaceY.toFixed(2)}:${this.kind}:${asteroid.pockets.length}:${asteroid.pockets.map((p) => `${p.angle.toFixed(3)}:${p.radiusT.toFixed(3)}`).join('|')}`;
     if (this.adult && this.adultKey === key) return this.adult;
     const scale = treeVisualScale(asteroid.radius, asteroid.seed);
     this.adult = buildAdultTree(
@@ -256,6 +258,7 @@ export class TreeView {
       polar.dist,
       polar.surfaceY,
       this.kind,
+      pocketsToTreeTargets(asteroid, polar),
     );
     this.adultKey = key;
     return this.adult;
@@ -382,15 +385,15 @@ export class TreeView {
 
     for (const b of geom.blobs) {
       wash.circle(b.x, b.y, b.r);
-      wash.fill({ color: this.pal.leaf, alpha: b.alpha * 0.85 });
+      wash.fill({ color: dietTinted(this.pal.leaf, this.pal, tree, 0.4), alpha: b.alpha * 0.85 });
       wash.circle(b.x + b.r * 0.18, b.y - b.r * 0.12, b.r * 0.55);
-      wash.fill({ color: this.pal.tuft, alpha: b.alpha * 0.45 });
+      wash.fill({ color: dietTinted(this.pal.tuft, this.pal, tree, 0.5), alpha: b.alpha * 0.45 });
     }
 
     for (const s of geom.strokes) {
       if (s.kind !== 'tuft' && s.kind !== 'grass') continue;
       if (s.kind === 'tuft') {
-        ribbon(wood, s.points, s.widthStart, s.widthEnd, this.pal.tuft, 0.72);
+        ribbon(wood, s.points, s.widthStart, s.widthEnd, dietTinted(this.pal.tuft, this.pal, tree, 0.5), 0.72);
         continue;
       }
       ribbon(wood, s.points, s.widthStart, s.widthEnd, this.pal.grass, 0.78);
@@ -399,7 +402,7 @@ export class TreeView {
         s.points,
         s.widthStart * 0.45,
         s.widthEnd * 0.4,
-        this.pal.leaf,
+        dietTinted(this.pal.leaf, this.pal, tree, 0.4),
         0.55,
       );
     }
@@ -412,7 +415,7 @@ export class TreeView {
         leaf.angle,
         leaf.length,
         leaf.width,
-        this.pal.leaf,
+        dietTinted(this.pal.leaf, this.pal, tree, 0.45),
         0.82,
       );
     }
@@ -777,6 +780,64 @@ function prefixUntil(
     acc += Math.hypot(pts[i]!.x - pts[i - 1]!.x, pts[i]!.y - pts[i - 1]!.y);
     out.push({ x: pts[i]!.x, y: pts[i]!.y });
     if (acc >= dist) break;
+  }
+  return out;
+}
+
+/**
+ * Distance from (px, py) to segment a–b, plus the parametric position along
+/**
+ * Convert asteroid pockets (polar, world units) into tree-local targets
+ * for the L-system seeker tendrils. The transform mirrors the inverse
+ * applied in `paintTendrils` so the geometry the L-system bakes matches
+ * the same frame the renderer will draw into.
+ */
+/**
+ * Tint a flora color by the tree's dietary bias. The dominant pocket kind
+ * (when the tree's intake is loud enough) pulls the foliage / tuft toward
+ * that resource's color, so the player can read at a glance whether a
+ * tree is feeding on mineral, water, or energy pockets. `amount` is the
+ * max blend (0..1); the effective blend is scaled by how strongly the
+ * bias dominates (so a barely-fed tree barely tints).
+ */
+function dietTinted(base: number, pal: FloraPalette, tree: Tree, amount: number): number {
+  const bias = tree.dietaryBias;
+  if (!bias) return base;
+  const total = bias.mineral + bias.water + bias.energy;
+  if (total < 1e-3) return base;
+  let bestKind: 'mineral' | 'water' | 'energy' = 'mineral';
+  let bestShare = bias.mineral;
+  if (bias.water > bestShare) { bestKind = 'water'; bestShare = bias.water; }
+  if (bias.energy > bestShare) { bestKind = 'energy'; bestShare = bias.energy; }
+  const tint = resourceKindHex(bestKind, pal);
+  // Strength: dominant share's surplus above an even split, plus a min
+  // floor so a clear bias (0.8) still bleeds through.
+  const strength = Math.min(1, (bestShare - 1 / 3) * 1.4 + 0.25) * (tree.maturity < 0.25 ? 0.4 : 1);
+  return mixHex(base, tint, amount * strength);
+}
+
+function pocketsToTreeTargets(
+  asteroid: Asteroid,
+  pose: { x: number; y: number; angle: number },
+): PocketTarget[] {
+  const rot = pose.angle + Math.PI / 2;
+  const cos = Math.cos(-rot);
+  const sin = Math.sin(-rot);
+  const ox = pose.x - asteroid.x;
+  const oy = pose.y - asteroid.y;
+  const out: PocketTarget[] = [];
+  for (const pocket of asteroid.pockets) {
+    const pr = pocket.radiusT * asteroid.radius;
+    const tx = Math.cos(pocket.angle) * pr - ox;
+    const ty = Math.sin(pocket.angle) * pr - oy;
+    const lx = tx * cos - ty * sin;
+    const ly = tx * sin + ty * cos;
+    out.push({
+      x: lx,
+      y: ly,
+      depthT: pocket.depthT,
+      kind: pocket.kind,
+    });
   }
   return out;
 }

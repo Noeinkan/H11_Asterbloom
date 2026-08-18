@@ -3,6 +3,8 @@ import {
   adjustSendCount,
   bumpSendCount,
   closestPreset,
+  countFromDialAngle,
+  dialAngleForCount,
   resolveSendCount,
   resolveSendExact,
 } from '../../src/game/input/sendCount';
@@ -99,5 +101,70 @@ describe('closestPreset', () => {
   it('falls back to fixed for arbitrary counts', () => {
     expect(closestPreset(12, 5)).toBe('fixed');
     expect(closestPreset(12, 7)).toBe('fixed');
+  });
+});
+
+describe('countFromDialAngle', () => {
+  it('returns 0 when there are no orbiters', () => {
+    expect(countFromDialAngle(0, 0)).toBe(0);
+    expect(countFromDialAngle(0, Math.PI)).toBe(0);
+  });
+
+  it('returns 0 at the start of the sweep (cursor at 12 o\'clock)', () => {
+    // Cursor at the top of the dial: (0, -1) → angle = -π/2.
+    expect(countFromDialAngle(10, -Math.PI / 2)).toBe(0);
+  });
+
+  it('grows linearly as the dial sweeps CW from the top', () => {
+    const max = 8;
+    // Cursor at 3 o'clock (right): angle = 0 → frac 1/4 → 2 of 8.
+    expect(countFromDialAngle(max, 0)).toBe(2);
+    // Cursor at 6 o'clock (bottom): angle = +π/2 → frac 1/2 → 4 of 8.
+    expect(countFromDialAngle(max, Math.PI / 2)).toBe(4);
+    // Cursor at 9 o'clock (left): angle = +π → frac 3/4 → 6 of 8.
+    expect(countFromDialAngle(max, Math.PI)).toBe(6);
+  });
+
+  it('drops back to 0 after a full revolution from the top', () => {
+    // The forward mapping is half-open, so an angle just past the start
+    // (mod 2π) sits in the last slice. A full revolution (back to the
+    // top) lands cleanly at 0, mirroring the dial's geometry.
+    const atTop = countFromDialAngle(10, -Math.PI / 2);
+    expect(atTop).toBe(0);
+    const justBefore = countFromDialAngle(10, -Math.PI / 2 - 0.001);
+    expect(justBefore).toBe(9);
+  });
+
+  it('clamps negative inputs into the valid range', () => {
+    expect(countFromDialAngle(10, -Math.PI * 3)).toBeGreaterThanOrEqual(0);
+    expect(countFromDialAngle(10, -Math.PI * 3)).toBeLessThanOrEqual(10);
+  });
+});
+
+describe('dialAngleForCount', () => {
+  it('returns 0 when there are no orbiters', () => {
+    expect(dialAngleForCount(0, 0)).toBe(0);
+    expect(dialAngleForCount(0, 5)).toBe(0);
+  });
+
+  it('returns the top-of-dial angle for zero seedlings', () => {
+    expect(dialAngleForCount(10, 0)).toBeCloseTo(-Math.PI / 2);
+  });
+
+  it('returns the bottom angle for half of an odd max', () => {
+    // 9 slices → 4.5 slices from the top lands cleanly at slice 4's
+    // midpoint (4 + 0.5) * (2π/9), which is just past 6 o'clock.
+    const slice = (Math.PI * 2) / 9;
+    const expected = -Math.PI / 2 + 4.5 * slice;
+    expect(dialAngleForCount(9, 4)).toBeCloseTo(expected, 5);
+  });
+
+  it('round-trips with countFromDialAngle for counts below max', () => {
+    const max = 8;
+    for (let i = 0; i < max; i++) {
+      const angle = dialAngleForCount(max, i);
+      const back = countFromDialAngle(max, angle);
+      expect(back).toBe(i);
+    }
   });
 });

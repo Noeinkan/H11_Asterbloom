@@ -49,7 +49,11 @@ describe('pastel rule', () => {
     expect(['void', 'aurora', 'nebula']).toContain(even.theme);
     if (odd.theme === 'void') {
       const [, , lOdd] = rgbToHsl(...hexToRgb(odd.bg));
-      expect(lOdd).toBeLessThan(0.22);
+      // Backdrop bg stays dark enough that ink readability is preserved,
+      // but lifted above pure black so the wash shows a visible color band
+      // (was 0.085; bumped to a Material-3 dark surface band).
+      expect(lOdd).toBeGreaterThan(0.3);
+      expect(lOdd).toBeLessThan(0.5);
     }
   });
 

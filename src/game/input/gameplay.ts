@@ -13,6 +13,7 @@ import { orbitBand, type TreeKind, type World } from '../sim/types';
 import { nextEmptySlot } from '../sim/world';
 import {
   bumpSendCount,
+  countFromDialAngle,
   isCoarsePointer,
   resolveSendCount,
   type SendMode,
@@ -124,6 +125,10 @@ export function bindGameplay(opts: {
     if (forceScout) {
       state.sendMode = 'scout';
       state.sendCount = resolveSendCount(n, 'scout', 1);
+    } else if (state.sendMode === 'precise') {
+      // Preserve the exact count the player already dialed in. Clamped to
+      // whatever the source asteroid can actually muster.
+      state.sendCount = resolveSendCount(n, 'precise', state.sendCount);
     } else {
       state.sendCount = resolveSendCount(n, state.sendMode, state.sendCount);
     }
@@ -282,15 +287,43 @@ export function bindGameplay(opts: {
           ? shortestPath(world, state.dragFromId, state.hoverTargetId)
           : null;
       const valid = !!path && path.length >= 2 && state.sendCount > 0;
-      const toX =
+
+      // Precise-send dial: while hovering the destination asteroid (or
+      // within a small slack around its rim), the cursor angle around the
+      // target sets the exact count to send. Switching to precise mode
+      // also flips the dock's highlight so the player sees they are no
+      // longer in scout / all / half.
+      const dest =
         state.hoverTargetId !== null
-          ? world.asteroids.get(state.hoverTargetId)!.x
-          : w.x;
-      const toY =
-        state.hoverTargetId !== null
-          ? world.asteroids.get(state.hoverTargetId)!.y
-          : w.y;
-      preview.show(from.x, from.y, toX, toY, state.sendCount, valid);
+          ? world.asteroids.get(state.hoverTargetId) ?? null
+          : null;
+      const dialActive =
+        dest !== null &&
+        (state.sendMode === 'precise' ||
+          Math.hypot(w.x - dest.x, w.y - dest.y) <= dest.radius + 14);
+      if (dialActive && dest !== null) {
+        const max = orbitCount(state.dragFromId);
+        if (max > 0) {
+          const angle = Math.atan2(w.y - dest.y, w.x - dest.x);
+          state.sendCount = countFromDialAngle(max, angle);
+          state.sendMode = 'precise';
+          onSendCountChange?.();
+        }
+      }
+
+      const toX = dest !== null ? dest.x : w.x;
+      const toY = dest !== null ? dest.y : w.y;
+      const finalValid = valid && state.sendCount > 0;
+      preview.show(
+        from.x,
+        from.y,
+        toX,
+        toY,
+        state.sendCount,
+        finalValid,
+        state.sendMode === 'precise' && dialActive,
+        orbitCount(state.dragFromId),
+      );
     }
   };
 
