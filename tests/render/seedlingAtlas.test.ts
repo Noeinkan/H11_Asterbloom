@@ -131,3 +131,39 @@ describe('seedlingVariant', () => {
     expect(seen.size).toBe(VARIANTS);
   });
 });
+
+/**
+ * Colorblind faction marks ride on the same key, because a mark changes the
+ * silhouette. The pref defaults off so that every existing caller — and every
+ * assertion above — keeps the shape it had before the pref existed.
+ */
+describe('faction marks', () => {
+  const marked = (s: Seedling) => seedlingShapeKey(seedlingShape(s, true));
+
+  it('draws no mark unless asked', () => {
+    expect(seedlingShape(unit()).mark).toBe('none');
+    expect(seedlingShape(unit(), false).mark).toBe('none');
+  });
+
+  it('changes the texture key, so marked hulls get their own texture', () => {
+    expect(marked(unit())).not.toBe(keyOf(unit()));
+  });
+
+  it('gives player, enemy and wild three different glyphs', () => {
+    const player = seedlingShape(unit({ faction: 'player' }), true).mark;
+    const enemy = seedlingShape(unit({ faction: 'enemy' }), true).mark;
+    const grey = seedlingShape(unit({ faction: 'grey' }), true).mark;
+    expect(new Set([player, enemy, grey]).size).toBe(3);
+    for (const m of [player, enemy, grey]) expect(m).not.toBe('none');
+  });
+
+  it('keeps two factions apart by glyph even at identical stats', () => {
+    const a = marked(unit({ faction: 'player', id: 7 }));
+    const b = marked(unit({ faction: 'enemy', id: 7 }));
+    expect(a).not.toBe(b);
+  });
+
+  it('still collapses same-faction units onto one key', () => {
+    expect(marked(unit({ id: 3 }))).toBe(marked(unit({ id: 3 })));
+  });
+});

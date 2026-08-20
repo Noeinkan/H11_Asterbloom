@@ -5,12 +5,22 @@ import {
 import type { Difficulty } from '../sim/types';
 import { difficultyLabel } from './copy';
 import {
+  applyHudScale,
   applyReducedMotionClass,
   GAME_VERSION,
+  nextHudScale,
+  readFactionMarks,
+  readHudScale,
+  readMinimap,
   readMuted,
   readReducedMotion,
+  readScreenFlash,
+  writeFactionMarks,
+  writeHudScale,
+  writeMinimap,
   writeMuted,
   writeReducedMotion,
+  writeScreenFlash,
 } from './prefs';
 
 export interface TitleHud {
@@ -28,7 +38,11 @@ export function createTitleHud(opts: {
   onSkirmish: (difficulty: Difficulty) => void;
   onCampaign: (index: number) => void;
   onMuteChange: (muted: boolean) => void;
-  onReducedMotionChange: (enabled: boolean) => void;
+  /** Any accessibility pref changed; the caller re-reads and re-applies them. */
+  onPrefsChange: () => void;
+  /** True when a mid-match save exists; decides whether Continue is offered. */
+  canContinue?: () => boolean;
+  onContinue?: () => void;
 }): TitleHud {
   const root = document.createElement('div');
   root.className = 'end-overlay title-overlay';
@@ -38,14 +52,24 @@ export function createTitleHud(opts: {
   let view: TitleView = 'home';
   let muted = readMuted();
   let reducedMotion = readReducedMotion();
+  let factionMarks = readFactionMarks();
+  let screenFlash = readScreenFlash();
+  let minimap = readMinimap();
+  let hudScale = readHudScale();
 
   const render = () => {
     if (view === 'home') {
+      // Only offered when there is actually something to resume, so the
+      // button never leads to an empty match.
+      const resume = opts.canContinue?.()
+        ? '<button type="button" data-nav="continue">Continue</button>'
+        : '';
       root.innerHTML = `
         <div class="end-card title-card">
           <p class="title-brand">Asterbloom</p>
           <p class="title-tag">Grow. Send. Claim the dark.</p>
           <div class="end-actions title-actions">
+            ${resume}
             <button type="button" data-nav="skirmish">Play</button>
             <button type="button" data-nav="campaign">Campaign</button>
             <button type="button" data-nav="settings">Settings</button>
@@ -101,6 +125,18 @@ export function createTitleHud(opts: {
             <button type="button" class="hud-mute" data-pref="motion">
               ${reducedMotion ? 'Reduced motion on' : 'Reduced motion off'}
             </button>
+            <button type="button" class="hud-mute" data-pref="flash">
+              ${screenFlash ? 'Screen flash on' : 'Screen flash off'}
+            </button>
+            <button type="button" class="hud-mute" data-pref="marks">
+              ${factionMarks ? 'Faction marks on' : 'Faction marks off'}
+            </button>
+            <button type="button" class="hud-mute" data-pref="scale">
+              HUD size ${Math.round(hudScale * 100)}%
+            </button>
+            <button type="button" class="hud-mute" data-pref="minimap">
+              ${minimap ? 'Minimap on' : 'Minimap off'}
+            </button>
           </div>
           <p class="title-version">v${GAME_VERSION}</p>
           <div class="end-actions title-actions title-back-row">
@@ -113,6 +149,10 @@ export function createTitleHud(opts: {
     root.querySelectorAll<HTMLButtonElement>('[data-nav]').forEach((btn) => {
       btn.addEventListener('click', () => {
         const nav = btn.dataset.nav;
+        if (nav === 'continue') {
+          opts.onContinue?.();
+          return;
+        }
         if (nav === 'skirmish') view = 'skirmish';
         else if (nav === 'campaign') view = 'campaign';
         else if (nav === 'settings') view = 'settings';
@@ -134,16 +174,35 @@ export function createTitleHud(opts: {
     });
     root.querySelectorAll<HTMLButtonElement>('[data-pref]').forEach((btn) => {
       btn.addEventListener('click', () => {
-        if (btn.dataset.pref === 'mute') {
+        const pref = btn.dataset.pref;
+        if (pref === 'mute') {
           muted = !muted;
           writeMuted(muted);
           opts.onMuteChange(muted);
-        } else if (btn.dataset.pref === 'motion') {
+          render();
+          return;
+        }
+        if (pref === 'motion') {
           reducedMotion = !reducedMotion;
           writeReducedMotion(reducedMotion);
           applyReducedMotionClass(reducedMotion);
-          opts.onReducedMotionChange(reducedMotion);
+        } else if (pref === 'flash') {
+          screenFlash = !screenFlash;
+          writeScreenFlash(screenFlash);
+        } else if (pref === 'marks') {
+          factionMarks = !factionMarks;
+          writeFactionMarks(factionMarks);
+        } else if (pref === 'scale') {
+          hudScale = nextHudScale(hudScale);
+          writeHudScale(hudScale);
+          applyHudScale(hudScale);
+        } else if (pref === 'minimap') {
+          minimap = !minimap;
+          writeMinimap(minimap);
         }
+        // One channel for every visual pref: the caller re-reads them all and
+        // pushes them at the renderer, so no branch here owns render policy.
+        opts.onPrefsChange();
         render();
       });
     });
@@ -157,6 +216,10 @@ export function createTitleHud(opts: {
       view = 'home';
       muted = readMuted();
       reducedMotion = readReducedMotion();
+      factionMarks = readFactionMarks();
+      screenFlash = readScreenFlash();
+      minimap = readMinimap();
+      hudScale = readHudScale();
       render();
       root.hidden = false;
     },

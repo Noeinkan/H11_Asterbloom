@@ -1,5 +1,6 @@
 import { Container, FillGradient, Graphics } from 'pixi.js';
 import { mulberry32 } from '../sim/rng';
+import { getVisualPrefs } from './visualPrefs';
 import {
   bucketHue,
   hslToHex,
@@ -132,9 +133,13 @@ export class Starfield {
    * one rebuild per second, which is all a breath this slow needs.
    */
   tick(t: number): void {
+    // Reduced motion holds the backdrop at its rest offset. Returning early
+    // would freeze it wherever it happened to be; drifting to (0, 0) instead
+    // means the pref always lands on the same picture.
+    const still = getVisualPrefs().reducedMotion;
     const slow = t * 0.05; // ≈ 20s per cycle; never distracting
-    const dx = quantize(Math.cos(slow) * 0.06, DRIFT_STEP);
-    const dy = quantize(Math.sin(slow * 0.8) * 0.04, DRIFT_STEP);
+    const dx = still ? 0 : quantize(Math.cos(slow) * 0.06, DRIFT_STEP);
+    const dy = still ? 0 : quantize(Math.sin(slow * 0.8) * 0.04, DRIFT_STEP);
     if (!this.gradientCache.setDrift(dx, dy)) return;
     paintBackdropForTheme(
       this.backdrop,

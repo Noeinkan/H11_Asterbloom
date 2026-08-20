@@ -634,6 +634,25 @@ export function factionCoreHue(faction: FactionId, floraHue: number): number {
   return floraHue;
 }
 
+/**
+ * Non-color faction cue. Everything above separates factions by hue alone,
+ * which is exactly the cue a red/green-blind player does not get; these are
+ * the shapes that carry the same information without it.
+ *
+ * The vocabulary is deliberately tiny and shared by every surface that draws
+ * a faction — seedling hulls, rock owner marks, minimap dots — so one glyph
+ * means one faction wherever it appears.
+ */
+export type FactionMark = 'none' | 'bar' | 'chevron' | 'ring';
+
+export const FACTION_MARK: Record<FactionId, FactionMark> = {
+  player: 'bar',
+  enemy: 'chevron',
+  grey: 'ring',
+  // Unowned rocks read as unowned; a glyph would imply a side.
+  neutral: 'none',
+};
+
 export function applySceneToDocument(scene: ScenePalette): void {
   const root = document.documentElement.style;
   root.setProperty('--ab-bg', cssHex(scene.bg));

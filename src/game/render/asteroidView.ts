@@ -33,6 +33,7 @@ import {
 } from '../sim/world';
 import {
   bucketHue,
+  FACTION_MARK,
   factionCoreHue,
   floraPalette,
   hslToHex,
@@ -45,6 +46,19 @@ import {
   type ScenePalette,
 } from './palette';
 import { paintSoftRing } from './treeView';
+import {
+  ambientMotion,
+  getVisualPrefs,
+  pocketFlashSeconds,
+} from './visualPrefs';
+
+/**
+ * Folds owner and pref into one string, so one comparison decides whether the
+ * owner glyph needs repainting.
+ */
+function markKeyFor(owner: FactionId): string {
+  return getVisualPrefs().factionMarks ? FACTION_MARK[owner] : 'off';
+}
 
 const NO_TREES: Tree[] = [];
 const SUBSTRATE_BINS = 180;
@@ -85,6 +99,8 @@ export class AsteroidView {
   private pocketLastAmount = new Map<number, number>();
   private pollenGfx: Graphics;
   private halo: Graphics;
+  /** Non-color owner glyph; empty unless the faction-marks pref is on. */
+  private marksGfx: Graphics;
   private lastSelected = false;
   private lastPlantKey = '';
   private lastOwner: FactionId;
@@ -92,6 +108,7 @@ export class AsteroidView {
   private lastShield = -1;
   private lastLifeKey = '';
   private lastFeedKey = '';
+  private markKey = '';
   private hitPulseUntil = 0;
   private pulsePhase: number;
   private bits: GrassBit[] = [];
@@ -180,6 +197,12 @@ export class AsteroidView {
     this.label.alpha = 0.7;
     this.root.addChild(this.label);
 
+    // Above the disc, mirroring the name below it. Its own Graphics so the
+    // halo's breathing alpha cannot wash the glyph out.
+    this.marksGfx = new Graphics();
+    this.root.addChild(this.marksGfx);
+    this.redrawOwnerMark(asteroid);
+
     this.redrawCore(asteroid, false);
     this.redrawSlots(asteroid, new Set(), false);
     this.redrawHalo(asteroid, false);
@@ -208,7 +231,13 @@ export class AsteroidView {
     const t = now / 1000;
     const dt = Math.min(0.05, Math.max(0, t - this.lastGrassTime));
     this.lastGrassTime = t;
-    if (this.lastShield >= 0 && asteroid.shield < this.lastShield - 0.05) {
+    const prefs = getVisualPrefs();
+    const motion = ambientMotion(prefs);
+    if (
+      prefs.screenFlash &&
+      this.lastShield >= 0 &&
+      asteroid.shield < this.lastShield - 0.05
+    ) {
       this.hitPulseUntil = now + 280;
     }
     this.lastShield = asteroid.shield;
@@ -226,6 +255,9 @@ export class AsteroidView {
     if (ownerChanged) {
       paintRock(this.rock, asteroid, this.pal);
     }
+    if (ownerChanged || this.markKey !== markKeyFor(asteroid.owner)) {
+      this.redrawOwnerMark(asteroid);
+    }
     if (plantKey !== this.lastPlantKey || selChanged) {
       this.redrawSlots(asteroid, plantableSlots, selected);
       this.lastPlantKey = plantKey;
@@ -242,18 +274,24 @@ export class AsteroidView {
       const u = sapRiseU(t, tree.seed);
       if (u < 0.16) launch = Math.max(launch, (1 - u / 0.16) * live);
     }
+    // `motion` is 0 under reduced motion, which collapses every decorative
+    // sine to its rest value without branching per term. Feed and launch are
+    // state, not decoration, so they keep animating either way.
     const pulse =
       0.88 +
-      Math.sin(t * 1.35 + this.pulsePhase) * 0.12 +
-      feed * (0.06 + Math.sin(t * 2.1 + this.pulsePhase) * 0.08);
+      Math.sin(t * 1.35 + this.pulsePhase) * 0.12 * motion +
+      feed * (0.06 + Math.sin(t * 2.1 + this.pulsePhase) * 0.08 * motion);
     this.core.alpha = Math.min(1.28, pulse + launch * 0.28);
     this.core.scale.set(1 + launch * 0.056);
-    this.halo.alpha = 0.85 + Math.sin(t * 0.7 + this.pulsePhase) * 0.15 + launch * 0.11;
-    this.halo.scale.set(1 + Math.sin(t * 0.55 + this.pulsePhase) * 0.018 + launch * 0.022);
+    this.halo.alpha =
+      0.85 + Math.sin(t * 0.7 + this.pulsePhase) * 0.15 * motion + launch * 0.11;
+    this.halo.scale.set(
+      1 + Math.sin(t * 0.55 + this.pulsePhase) * 0.018 * motion + launch * 0.022,
+    );
 
     // Animate shield with transform — do not rebuild the stroke every frame.
     if (asteroid.maxShield > 0 && asteroid.shield > 0) {
-      const shimmer = 0.5 + 0.5 * Math.sin(t * 3.2 + this.pulsePhase);
+      const shimmer = (0.5 + 0.5 * Math.sin(t * 3.2 + this.pulsePhase)) * motion;
       const hit = now < this.hitPulseUntil;
       this.selectionRing.alpha = 0.85 + shimmer * 0.15 + (hit ? 0.2 : 0);
       this.selectionRing.scale.set(1 + shimmer * 0.012 + (hit ? 0.03 : 0));
@@ -275,6 +313,7 @@ export class AsteroidView {
     g.alpha = 1;
     const pockets = asteroid.pockets;
     if (pockets.length === 0) return;
+    const flashWindow = pocketFlashSeconds(getVisualPrefs());
 
     for (const pocket of pockets) {
       const px = Math.cos(pocket.angle) * pocket.radiusT * asteroid.radius;
@@ -289,13 +328,22 @@ export class AsteroidView {
       const size = asteroid.radius * 0.1 * (0.72 + 0.28 * fill);
 
       // Feeding flash: brighten briefly when the pocket is actively drained.
+      // A zero window never sets a future deadline, so `flash` stays 0 and
+      // the extra ring below is skipped outright.
       const last = this.pocketLastAmount.get(pocket.id);
-      if (last !== undefined && last - pocket.amount > 0.001) {
-        this.pocketFlashUntil.set(pocket.id, time + 0.6);
+      if (
+        flashWindow > 0 &&
+        last !== undefined &&
+        last - pocket.amount > 0.001
+      ) {
+        this.pocketFlashUntil.set(pocket.id, time + flashWindow);
       }
       this.pocketLastAmount.set(pocket.id, pocket.amount);
       const flashUntil = this.pocketFlashUntil.get(pocket.id) ?? 0;
-      const flash = Math.max(0, Math.min(1, (flashUntil - time) / 0.6));
+      const flash =
+        flashWindow > 0
+          ? Math.max(0, Math.min(1, (flashUntil - time) / flashWindow))
+          : 0;
       if (flashUntil < time) this.pocketFlashUntil.delete(pocket.id);
 
       paintSoftRing(
@@ -411,6 +459,8 @@ export class AsteroidView {
     this.redrawCore(asteroid, selected, trees);
     this.redrawHalo(asteroid, selected);
     this.redrawSlots(asteroid, plantableSlots, selected);
+    // The owner glyph is drawn in `pal.core`, which just moved.
+    this.redrawOwnerMark(asteroid);
     this.lastLifeKey = '';
     this.lifeDirty = true;
     this.substrateDirty = true;
@@ -797,6 +847,42 @@ export class AsteroidView {
         alpha: 0.18 * c,
       });
     }
+  }
+
+  /**
+   * Owner glyph above the disc. Repainted only when the owner or the pref
+   * changes — `markKey` folds both, so a pref toggle repaints exactly once
+   * even though `update` runs every frame.
+   */
+  private redrawOwnerMark(asteroid: Asteroid): void {
+    const g = this.marksGfx;
+    g.clear();
+    this.markKey = markKeyFor(asteroid.owner);
+    if (!getVisualPrefs().factionMarks) return;
+    const mark = FACTION_MARK[asteroid.owner];
+    if (mark === 'none') return;
+
+    const r = Math.max(7, asteroid.radius * 0.13);
+    const y = -(asteroid.radius + 18 + r);
+    const color = this.pal.core;
+    const width = Math.max(2, r * 0.34);
+    const alpha = 0.78;
+
+    if (mark === 'bar') {
+      g.moveTo(-r * 0.85, y);
+      g.lineTo(r * 0.85, y);
+      g.stroke({ width, color, alpha });
+      return;
+    }
+    if (mark === 'chevron') {
+      g.moveTo(-r * 0.8, y + r * 0.45);
+      g.lineTo(0, y - r * 0.5);
+      g.lineTo(r * 0.8, y + r * 0.45);
+      g.stroke({ width, color, alpha, join: 'miter' });
+      return;
+    }
+    g.circle(0, y, r * 0.72);
+    g.stroke({ width, color, alpha });
   }
 
   private redrawHalo(asteroid: Asteroid, selected: boolean): void {

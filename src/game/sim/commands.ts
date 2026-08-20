@@ -19,6 +19,7 @@ import {
   getOccupiedSlots,
   hasHostileOrbiters,
   hasHostileTrees,
+  nextEmptySlot,
   plantPose,
   spawnOrbiters,
 } from './world';
@@ -188,6 +189,24 @@ export function plantDyson(
   faction: FactionId,
 ): CommandResult {
   return plantTree(world, asteroidId, slotIndex, faction, 'dyson');
+}
+
+/**
+ * Plant from a crust bearing rather than a slot index: the command picks the
+ * slot itself. Callers that only know where the player clicked — the crust
+ * menu, and the offline replay that re-applies it — must not reproduce slot
+ * resolution, because which slot is free depends on live world state.
+ */
+export function plantOnCrustAngle(
+  world: World,
+  asteroidId: number,
+  angle: number,
+  faction: FactionId,
+  kind: TreeKind = 'dyson',
+): CommandResult {
+  const slot = nextEmptySlot(world, asteroidId);
+  if (slot === null) return { ok: false, reason: 'slot taken' };
+  return plantTree(world, asteroidId, slot, faction, kind, angle);
 }
 
 export function countFactionOrbiting(

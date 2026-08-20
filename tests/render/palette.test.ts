@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import type { FactionId } from '../../src/game/sim/types';
 import {
   accentHue,
   BACKGROUND_THEMES,
   bucketHue,
+  FACTION_MARK,
   buildScene,
   buildSceneForTheme,
   createScenePalette,
@@ -266,5 +268,32 @@ describe('theme contrast', () => {
     const [, , lLight] = rgbToHsl(...hexToRgb(wingLight.wing));
     // Wings get ~0.28 darker on paper so they don't dissolve into the wash.
     expect(lDark - lLight).toBeGreaterThan(0.2);
+  });
+});
+/**
+ * Faction identity is hue-only everywhere else in the renderer, which is the
+ * cue a colorblind player does not get. These glyphs are the substitute, so
+ * the vocabulary has to stay total and stay distinct.
+ */
+describe('faction marks', () => {
+  it('covers every faction', () => {
+    const factions: FactionId[] = ['player', 'neutral', 'enemy', 'grey'];
+    for (const f of factions) {
+      expect(FACTION_MARK[f]).toBeDefined();
+    }
+  });
+
+  it('gives the three playable sides distinct, non-empty glyphs', () => {
+    const marks = [
+      FACTION_MARK.player,
+      FACTION_MARK.enemy,
+      FACTION_MARK.grey,
+    ];
+    expect(new Set(marks).size).toBe(3);
+    for (const m of marks) expect(m).not.toBe('none');
+  });
+
+  it('leaves unowned rocks unmarked, so a glyph always implies a side', () => {
+    expect(FACTION_MARK.neutral).toBe('none');
   });
 });

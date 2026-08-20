@@ -10,7 +10,7 @@ function isHudControlTarget(target: EventTarget | null): boolean {
   if (!(target instanceof Element)) return false;
   return Boolean(
     target.closest(
-      'button, a, input, select, textarea, [role="button"], .end-overlay, .pause-overlay, .title-overlay, .first-run-overlay, .crust-menu',
+      'button, a, input, select, textarea, [role="button"], .end-overlay, .pause-overlay, .title-overlay, .first-run-overlay, .crust-menu, .hud-minimap',
     ),
   );
 }

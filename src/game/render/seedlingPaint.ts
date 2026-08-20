@@ -2,7 +2,11 @@ import { Graphics } from 'pixi.js';
 import { mulberry32 } from '../sim/rng';
 import type { SeedlingKind, Stats } from '../sim/types';
 import { paintGlowEllipse } from './glow';
-import { seedlingColors, type ScenePalette } from './palette';
+import {
+  seedlingColors,
+  type FactionMark,
+  type ScenePalette,
+} from './palette';
 
 export interface HullPaintOptions {
   stats: Stats;
@@ -26,6 +30,11 @@ export interface HullPaintOptions {
    * Used to fade the calyx after a seed leaves.
    */
   departure?: number;
+  /**
+   * Non-color faction glyph stamped on the hull. 'none' (the default) draws
+   * nothing, so the silhouette is byte-identical to before the pref existed.
+   */
+  mark?: FactionMark;
 }
 
 export interface HullPaintResult {
@@ -122,7 +131,55 @@ export function paintSeedHull(
   g.circle(bodyL * 0.1, bodyW * germY, Math.max(0.55 * scale, bodyW * 0.32));
   g.fill({ color: wing, alpha: 0.92 });
 
+  paintFactionMark(g, opts.mark ?? 'none', bodyL, bodyW, scale, bodyColor);
+
   return { bodyLength: bodyL, bodyWidth: bodyW };
+}
+
+/**
+ * Faction glyph on the hull's back, drawn in the wing color so it reads as a
+ * marking rather than a second body. Sized off the hull, so it holds its
+ * proportion at every zoom the atlas bakes.
+ *
+ * Deliberately three primitives at most: this runs once per atlas texture,
+ * but the shapes have to stay legible when the hull is a few pixels wide.
+ */
+function paintFactionMark(
+  g: Graphics,
+  mark: FactionMark,
+  bodyL: number,
+  bodyW: number,
+  scale: number,
+  ink: number,
+): void {
+  if (mark === 'none') return;
+  const w = Math.max(0.4 * scale, bodyW * 0.42);
+  const cx = -bodyL * 0.06;
+  const alpha = 0.95;
+
+  if (mark === 'bar') {
+    // A stripe across the back — reads at the smallest size of the three.
+    g.moveTo(cx, -w);
+    g.lineTo(cx, w);
+    g.stroke({ width: Math.max(0.42 * scale, bodyW * 0.36), color: ink, alpha });
+    return;
+  }
+  if (mark === 'chevron') {
+    const h = w * 1.05;
+    g.moveTo(cx - h * 0.55, -w);
+    g.lineTo(cx + h * 0.5, 0);
+    g.lineTo(cx - h * 0.55, w);
+    g.stroke({
+      width: Math.max(0.36 * scale, bodyW * 0.3),
+      color: ink,
+      alpha,
+      join: 'miter',
+    });
+    return;
+  }
+  // 'ring' — an open circle, distinct in silhouette from bar and chevron.
+  g.circle(cx, 0, w * 0.86);
+  g.stroke({ width: Math.max(0.34 * scale, bodyW * 0.26), color: ink, alpha });
 }
 
 /**

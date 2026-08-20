@@ -5,15 +5,29 @@ import { createCrustMenu } from './game/hud/crustMenu';
 import { createDebugOverlay } from './game/hud/debugOverlay';
 import { createFactionPlate } from './game/hud/hudFactionPlate';
 import { createHudControls } from './game/hud/hudControls';
+import { createMinimapHud, type MinimapHud } from './game/hud/minimapHud';
 import {
   CRUST_MENU_ASK,
   crustPlantActionLabel,
 } from './game/hud/copy';
 import { createPauseHud } from './game/hud/pauseHud';
 import {
+  clearSave,
+  hasSave,
+  readSave,
+  SAVE_SCHEMA_VERSION,
+  writeSave,
+} from './game/hud/saveStore';
+import {
+  applyHudScale,
   applyReducedMotionClass,
+  GAME_VERSION,
+  readFactionMarks,
+  readHudScale,
+  readMinimap,
   readMuted,
   readReducedMotion,
+  readScreenFlash,
   writeMuted,
 } from './game/hud/prefs';
 import { PerfProbe } from './game/hud/perfProbe';
@@ -27,6 +41,7 @@ import {
   plantOnCrust,
   shouldLeftPan,
   type GameplayState,
+  type PlayerIntent,
 } from './game/input/gameplay';
 import {
   bumpSendCount,
@@ -49,6 +64,7 @@ import {
 } from './game/render/palette';
 import { SeedlingLayer } from './game/render/seedlingView';
 import { inView, type ViewBox } from './game/render/viewport';
+import { getVisualPrefs, setVisualPrefs } from './game/render/visualPrefs';
 import { SendPreview } from './game/render/sendPreview';
 import { Starfield } from './game/render/starfield';
 import {
@@ -64,6 +80,17 @@ import {
 } from './game/sim/campaign';
 import { countFactionOrbiting } from './game/sim/commands';
 import {
+  createReplayLog,
+  encodeReplay,
+  recordPlant,
+  recordSend,
+  type ReplayLog,
+} from './game/sim/replay';
+import {
+  deserializeWorld,
+  serializeWorld,
+} from './game/sim/serialize';
+import {
   createMatchRuntime,
   DEFAULT_MATCH_CONFIG,
   matchStatus,
@@ -72,16 +99,16 @@ import {
   type MatchRuntime,
   type MatchStatus,
 } from './game/sim/match';
-import type {
-  Difficulty,
-  FactionId,
-  SeedlingState,
-  Tree,
-  World,
+import {
+  SIM_DT,
+  type Difficulty,
+  type FactionId,
+  type SeedlingState,
+  type Tree,
+  type World,
 } from './game/sim/types';
 import { countOrbitingKind, createEmptyWorld, tick } from './game/sim/world';
 
-const SIM_DT = 1 / 60;
 const FPS_SAMPLE_MS = 500;
 const DEFAULT_SESSION_SEED = 0xc0a1f00d;
 
@@ -91,6 +118,13 @@ const DEFAULT_SESSION_SEED = 0xc0a1f00d;
  * turns one 12-rock stall into a repaint that finishes well inside the
  * ~30 frames before the next step, with no visible lag.
  */
+/**
+ * Autosave cadence. `localStorage.setItem` is a synchronous main-thread write
+ * of ~60 KB, so this is deliberately not per-second; the pause and tab-hide
+ * hooks cover the moments a player actually expects to be safe.
+ */
+const AUTOSAVE_SECONDS = 10;
+
 const ROCK_REPAINTS_PER_FRAME = 2;
 const TREE_REPAINTS_PER_FRAME = 2;
 
@@ -175,6 +209,23 @@ function createPocketTooltip(host: HTMLElement): PocketTooltip {
       root.remove();
     },
   };
+}
+
+/**
+ * Everything `beginPlayingWorld` normally resets that a resumed match wants
+ * back. Every field is optional and defaults to the value a fresh match uses,
+ * so the three existing callers are unaffected.
+ */
+interface WorldEntryRestore {
+  camera?: { x: number; y: number; zoom: number };
+  gameplay?: Partial<
+    Pick<
+      GameplayState,
+      'selectedAsteroidId' | 'sendCount' | 'sendMode' | 'plantKind'
+    >
+  >;
+  palTime?: number;
+  matchRuntime?: MatchRuntime;
 }
 
 /** `/field.html` skips title / campaign and drops onto a skirmish map. */
@@ -318,7 +369,6 @@ async function boot(): Promise<void> {
   if (!host) throw new Error('#app missing');
   await loadUiFonts();
 
-  applyReducedMotionClass(readReducedMotion());
   const audio = new GameAudio();
   audio.setEnabled(!readMuted());
 
@@ -386,6 +436,10 @@ async function boot(): Promise<void> {
   let followSendEnabled = false;
   let followingSend = false;
   let acc = 0;
+  /** Completed sim steps this match — the replay log's timebase. */
+  let simTick = 0;
+  /** Seconds since the last autosave. */
+  let saveAcc = 0;
   let palTime = 0;
   let hudAcc = 0;
   let debugAcc = 0;
@@ -418,6 +472,52 @@ async function boot(): Promise<void> {
   let slowSamples = 0;
   let fastSamples = 0;
   const perf = new PerfProbe();
+
+  /** Created below, but `applyVisualPrefs` runs before that. */
+  let minimap: MinimapHud | null = null;
+
+  /**
+   * Command log for the running match. Null when the match cannot produce a
+   * valid replay — a resumed save starts mid-simulation, so a log from that
+   * point would not reproduce anything.
+   */
+  let replayLog: ReplayLog | null = null;
+
+  const recordIntent = (intent: PlayerIntent) => {
+    if (!replayLog) return;
+    if (intent.kind === 'send') {
+      recordSend(replayLog, simTick, intent.fromId, intent.toId, intent.count);
+    } else {
+      recordPlant(
+        replayLog,
+        simTick,
+        intent.asteroidId,
+        intent.angle,
+        intent.treeKind,
+      );
+    }
+  };
+
+  /**
+   * Pull every accessibility pref out of storage and push it at the things
+   * that render. One function for boot and for every Settings change, so the
+   * two paths cannot drift. Declared here because it touches the view maps.
+   */
+  const applyVisualPrefs = () => {
+    const reducedMotion = readReducedMotion();
+    applyReducedMotionClass(reducedMotion);
+    applyHudScale(readHudScale());
+    setVisualPrefs({
+      reducedMotion,
+      screenFlash: readScreenFlash(),
+      factionMarks: readFactionMarks(),
+    });
+    minimap?.setEnabled(readMinimap());
+    // Owner marks are baked into each rock's paint, so a marks toggle has to
+    // dirty every view; the repaint budget drains them a couple per frame.
+    for (const id of asteroidViews.keys()) rockRepaints.add(id);
+  };
+  applyVisualPrefs();
 
   const canAct = () =>
     sessionMode === 'playing' &&
@@ -458,6 +558,7 @@ async function boot(): Promise<void> {
     crustMenu.hide();
     pauseHud.show({ showNewMap: playMode === 'skirmish' });
     hudControls.setPauseActive(true);
+    captureSave();
   };
 
   const setFollowSend = (enabled: boolean) => {
@@ -524,15 +625,19 @@ async function boot(): Promise<void> {
     nextWorld: World,
     seed: number,
     config: MatchConfig,
+    restore?: WorldEntryRestore,
   ) => {
     clearWorldViews();
     world = nextWorld;
     sessionSeed = seed;
     matchConfig = config;
-    matchRuntime = createMatchRuntime();
+    matchRuntime = restore?.matchRuntime ?? createMatchRuntime();
+    // Set before the scene is built: a resumed match has to pick the palette
+    // and starfield up where it left them instead of snapping back to 0.
+    palTime = restore?.palTime ?? 0;
     writeSeedHash(sessionSeed);
     pauseHud.setSeed(formatSeedHex(sessionSeed));
-    writeScene(scene, sceneAtTime(world.seed, 0));
+    writeScene(scene, sceneAtTime(world.seed, palTime));
     applySceneToDocument(scene);
     // Seed the soundtrack from the world seed, so a map's theme is as fixed
     // as its palette and starfield.
@@ -543,7 +648,10 @@ async function boot(): Promise<void> {
       starfield.retheme(scene, themes.themeA, themes.themeB, themes.mix);
     }
 
-    const home = [...world.asteroids.values()].find((a) => a.owner === 'player')!;
+    // A resumed save can be a match the player was already losing, with no
+    // player-owned rock left — so this cannot assume one exists.
+    const rocks = [...world.asteroids.values()];
+    const home = rocks.find((a) => a.owner === 'player') ?? rocks[0]!;
     asteroidViews = new Map();
     for (const a of world.asteroids.values()) {
       const view = new AsteroidView(a, scene);
@@ -567,6 +675,7 @@ async function boot(): Promise<void> {
     syncTrees();
 
     gameplay = createGameplayState(home.id);
+    if (restore?.gameplay) Object.assign(gameplay, restore.gameplay);
     sessionHud.setPlantKind(gameplay.plantKind);
     const bound = bindGameplay({
       canvas: app.canvas,
@@ -575,7 +684,12 @@ async function boot(): Promise<void> {
       state: gameplay,
       preview,
       audio,
-      onCommand: (result) => sessionHud.showCommandResult(result),
+      onCommand: (result, intent) => {
+        sessionHud.showCommandResult(result);
+        // Only successes go in the log: a rejected command mutates nothing,
+        // so replaying it would be a no-op at best and a divergence at worst.
+        if (result.ok) recordIntent(intent);
+      },
       onSend: () => {
         if (followSendEnabled) followingSend = true;
       },
@@ -598,6 +712,12 @@ async function boot(): Promise<void> {
             );
             sessionHud.showCommandResult(result);
             if (result.ok) {
+              recordIntent({
+                kind: 'plant',
+                asteroidId: hit.asteroidId,
+                angle: hit.angle,
+                treeKind: gameplay.plantKind,
+              });
               audio.plant(gameplay.plantKind, screenPan(hit.screenX));
               syncTrees();
             } else {
@@ -610,15 +730,31 @@ async function boot(): Promise<void> {
     unbindGameplay = bound.unbind;
     abortGameplay = bound.abort;
 
-    camera.zoom = 0.85;
-    camera.centerOn(home.x, home.y, app.screen.width, app.screen.height);
+    if (restore?.camera) {
+      camera.zoom = restore.camera.zoom;
+      camera.x = restore.camera.x;
+      camera.y = restore.camera.y;
+      camera.apply();
+    } else {
+      camera.zoom = 0.85;
+      camera.centerOn(home.x, home.y, app.screen.width, app.screen.height);
+    }
     followingSend = false;
 
     sessionMode = 'playing';
     paused = false;
     status = 'playing';
     acc = 0;
-    palTime = 0;
+    simTick = 0;
+    saveAcc = 0;
+    replayLog = restore
+      ? null
+      : createReplayLog(
+          playMode === 'campaign'
+            ? { mode: 'campaign', index: campaignIndex }
+            : { mode: 'skirmish', seed, difficulty: skirmishDifficulty },
+        );
+    // palTime is set above, before the scene is built.
     combatSnap = fillCombatSnap(world, combatSnap);
     lastHueKey = Math.round(scene.hue);
     lastPaletteKey = '';
@@ -627,12 +763,78 @@ async function boot(): Promise<void> {
     sessionHud.setVisible(true);
     titleHud.hide();
     factionPlate.setVisible(true);
+    minimap?.retheme(scene);
+    minimap?.setVisible(true);
     hudControls.setVisible(true);
     hudControls.setPauseActive(false);
     factionPlate.sync(world, gameplay.selectedAsteroidId);
   };
 
+  /**
+   * Snapshot the live match into the save slot. Cheap enough to call on a
+   * timer; a failed write (full or unavailable storage) is ignored on purpose,
+   * because losing a save is not worth interrupting play for.
+   */
+  const captureSave = () => {
+    if (sessionMode !== 'playing') return;
+    if (status !== 'playing') return;
+    writeSave({
+      schema: SAVE_SCHEMA_VERSION,
+      version: GAME_VERSION,
+      savedAt: Date.now(),
+      mode: playMode,
+      seed: sessionSeed,
+      difficulty: skirmishDifficulty,
+      campaignIndex,
+      campaignTitle,
+      matchConfig,
+      holdAcc: matchRuntime.holdAcc,
+      world: serializeWorld(world),
+      camera: { x: camera.x, y: camera.y, zoom: camera.zoom },
+      view: {
+        selectedAsteroidId: gameplay.selectedAsteroidId,
+        sendCount: gameplay.sendCount,
+        sendMode: gameplay.sendMode,
+        plantKind: gameplay.plantKind,
+      },
+      followSend: followSendEnabled,
+      palTime,
+    });
+  };
+
+  /**
+   * Pick up the saved match. Returns false when there is nothing to resume or
+   * the payload cannot be trusted, in which case the slot is cleared so the
+   * title screen stops offering it.
+   */
+  const resumeSaved = (): boolean => {
+    const snap = readSave();
+    if (!snap) return false;
+    let restoredWorld: World;
+    try {
+      restoredWorld = deserializeWorld(snap.world);
+    } catch {
+      clearSave();
+      return false;
+    }
+    playMode = snap.mode;
+    skirmishDifficulty = snap.difficulty;
+    campaignIndex = snap.campaignIndex;
+    campaignTitle = snap.campaignTitle;
+    beginPlayingWorld(restoredWorld, snap.seed, snap.matchConfig, {
+      camera: snap.camera,
+      gameplay: snap.view,
+      palTime: snap.palTime,
+      matchRuntime: { holdAcc: snap.holdAcc },
+    });
+    // beginPlayingWorld does not touch follow-send, so restore it after.
+    setFollowSend(snap.followSend);
+    return true;
+  };
+
   const startSkirmish = (difficulty: Difficulty, seed?: number) => {
+    // A new match replaces the old one; the stale save must not outlive it.
+    clearSave();
     playMode = 'skirmish';
     skirmishDifficulty = difficulty;
     campaignTitle = '';
@@ -642,6 +844,7 @@ async function boot(): Promise<void> {
   };
 
   const startCampaign = (index: number) => {
+    clearSave();
     playMode = 'campaign';
     const started = startCampaignMap(index);
     campaignIndex = started.mapIndex;
@@ -673,6 +876,7 @@ async function boot(): Promise<void> {
     sessionHud.dismissFirstRun();
     titleHud.show();
     factionPlate.setVisible(false);
+    minimap?.setVisible(false);
     hudControls.setVisible(false);
     hudControls.setPauseActive(false);
     hudControls.setHelpActive(false);
@@ -766,15 +970,32 @@ async function boot(): Promise<void> {
       if (sessionHud.maybeShowFirstRun()) firstRunBlocking = true;
     },
     onMuteChange: (muted) => setMuted(muted),
-    onReducedMotionChange: () => {
-      /* title already wrote pref + applied class */
+    onPrefsChange: () => applyVisualPrefs(),
+    canContinue: () => hasSave(),
+    onContinue: () => {
+      // A stale or unreadable slot falls through to the normal title screen
+      // rather than dropping the player into a broken match.
+      if (!resumeSaved()) titleHud.show();
     },
   });
 
-  debugOverlay = createDebugOverlay(host);
+  debugOverlay = createDebugOverlay(host, {
+    onCopyReplay: () => (replayLog ? encodeReplay(replayLog) : null),
+  });
   pocketTip = createPocketTooltip(host);
 
   factionPlate = createFactionPlate(host, sessionHud.root.querySelector('.hud-bar'));
+  minimap = createMinimapHud({
+    host,
+    scene,
+    anchor: sessionHud.root.querySelector('.hud-bar'),
+    onRecenter: (worldX, worldY) => {
+      camera.centerOn(worldX, worldY, app.screen.width, app.screen.height);
+      // Dragging the minimap is a camera command; it must win over follow-send.
+      cancelFollow();
+    },
+  });
+  minimap.setEnabled(readMinimap());
   hudControls = createHudControls({
     host,
     onPause: () => {
@@ -867,6 +1088,9 @@ async function boot(): Promise<void> {
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) return;
     if (sessionMode !== 'playing') return;
+    // Save before the guards below: a hidden tab may never come back, and an
+    // already-paused match still deserves an up-to-date save.
+    captureSave();
     if (!sessionHud.endOverlay.hidden) return;
     if (pauseHud.isVisible()) return;
     pauseMatch();
@@ -957,7 +1181,9 @@ async function boot(): Promise<void> {
       }
     }
     cameraInput.tick(frameDt);
-    palTime += frameDt;
+    // The hue/theme cycle is the largest ambient motion on screen; freezing
+    // palTime holds the whole palette and starfield still.
+    if (!getVisualPrefs().reducedMotion) palTime += frameDt;
 
     if (
       sessionMode === 'playing' &&
@@ -976,14 +1202,28 @@ async function boot(): Promise<void> {
         combatSnap = combat.snap;
         if (combat.fighting) combatHeat = 1;
         combatSnapB = before;
+        simTick += 1;
         acc -= SIM_DT;
       }
       perf.stop();
+
+      // Autosave. Skipped while the first-run overlay blocks play, since
+      // nothing has happened yet worth writing.
+      if (!firstRunBlocking) {
+        saveAcc += frameDt;
+        if (saveAcc >= AUTOSAVE_SECONDS) {
+          saveAcc = 0;
+          captureSave();
+        }
+      }
+
       const next = matchStatus(world, matchConfig, matchRuntime);
       if (next !== 'playing') {
         status = next;
         paused = false;
         pauseHud.hide();
+        // The match is over; there is nothing left to resume.
+        clearSave();
         const isLastCampaign =
           playMode === 'campaign' &&
           next === 'won' &&
@@ -1052,6 +1292,7 @@ async function boot(): Promise<void> {
       seedlings?.retheme(scene);
       preview.retheme();
       graphView.retheme(scene);
+      minimap?.retheme(scene);
       for (const id of asteroidViews.keys()) rockRepaints.add(id);
       for (const id of treeViews.keys()) treeRepaints.add(id);
     }
@@ -1182,6 +1423,7 @@ async function boot(): Promise<void> {
         gameplay.sendMode,
       );
       factionPlate.sync(world, selId);
+      minimap?.sync(world, viewBox);
       if (!sessionHud.isFirstRunVisible()) hudControls.setHelpActive(false);
       if (debugOverlay.isVisible()) {
         debugAcc += frameDt;

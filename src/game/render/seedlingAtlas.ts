@@ -1,6 +1,6 @@
 import { Graphics, Texture, type Renderer } from 'pixi.js';
 import type { FactionId, Seedling, SeedlingKind, Stats } from '../sim/types';
-import type { ScenePalette } from './palette';
+import { FACTION_MARK, type FactionMark, type ScenePalette } from './palette';
 import { paintSeedHull } from './seedlingPaint';
 
 /**
@@ -40,6 +40,8 @@ export interface SeedlingShape {
   stats: Stats;
   /** Stands in for the unit id, so jitter is shared across the bucket. */
   variant: number;
+  /** Non-color faction glyph; 'none' unless the accessibility pref is on. */
+  mark: FactionMark;
 }
 
 /**
@@ -60,7 +62,11 @@ export function seedlingVariant(id: number): number {
   return (Math.imul(id, 0x9e3779b9) >>> 29) % VARIANTS;
 }
 
-export function seedlingShape(s: Seedling): SeedlingShape {
+/**
+ * `marks` defaults off so existing callers and specs keep the shape they had;
+ * only the seedling layer, which knows the pref, opts in.
+ */
+export function seedlingShape(s: Seedling, marks = false): SeedlingShape {
   return {
     faction: s.faction,
     kind: s.kind,
@@ -70,12 +76,15 @@ export function seedlingShape(s: Seedling): SeedlingShape {
       speed: quantize(s.stats.speed, EXTRA_WINGS_AT),
     },
     variant: seedlingVariant(s.id),
+    mark: marks ? FACTION_MARK[s.faction] : 'none',
   };
 }
 
 export function seedlingShapeKey(shape: SeedlingShape): string {
   const st = shape.stats;
-  return `${shape.faction}|${shape.kind}|${st.energy}|${st.strength}|${st.speed}|${shape.variant}`;
+  // The mark is part of the key: toggling the pref mints new textures rather
+  // than repainting live ones, and LRU eviction retires the old set.
+  return `${shape.faction}|${shape.kind}|${st.energy}|${st.strength}|${st.speed}|${shape.variant}|${shape.mark}`;
 }
 
 export interface AtlasEntry {
@@ -203,6 +212,7 @@ export class SeedlingAtlas {
       kind: shape.kind,
       id: shape.variant,
       open: 1,
+      mark: shape.mark,
     });
     const b = g.getLocalBounds();
     const texture = this.renderer.generateTexture({

@@ -3,14 +3,13 @@ import type { Camera } from '../render/camera';
 import type { SendPreview } from '../render/sendPreview';
 import {
   countFactionOrbiting,
-  plantTree,
+  plantOnCrustAngle,
   sendSeedlings,
   type CommandResult,
 } from '../sim/commands';
 import { shortestPath } from '../sim/graph';
 import { hitRockCrust } from '../sim/rock';
 import { orbitBand, type TreeKind, type World } from '../sim/types';
-import { nextEmptySlot } from '../sim/world';
 import {
   bumpSendCount,
   countFromDialAngle,
@@ -52,6 +51,15 @@ const FINE_CRUST_HIT = 22;
 const COARSE_CRUST_HIT = 36;
 const HOLD_MS = 480;
 
+/**
+ * What the player asked for, alongside what the command returned. The replay
+ * log records the request rather than the outcome, so this carries the crust
+ * bearing rather than the slot the command happened to pick.
+ */
+export type PlayerIntent =
+  | { kind: 'send'; fromId: number; toId: number; count: number }
+  | { kind: 'plant'; asteroidId: number; angle: number; treeKind: TreeKind };
+
 export interface CrustMenuHit {
   asteroidId: number;
   angle: number;
@@ -65,9 +73,7 @@ export function plantOnCrust(
   asteroidId: number,
   angle: number,
 ): CommandResult {
-  const slot = nextEmptySlot(world, asteroidId);
-  if (slot === null) return { ok: false, reason: 'slot taken' };
-  return plantTree(world, asteroidId, slot, 'player', state.plantKind, angle);
+  return plantOnCrustAngle(world, asteroidId, angle, 'player', state.plantKind);
 }
 
 export function bindGameplay(opts: {
@@ -78,7 +84,7 @@ export function bindGameplay(opts: {
   preview: SendPreview;
   audio: GameAudio;
   /** Fired for every plant/send attempt (success or failure). */
-  onCommand?: (result: CommandResult) => void;
+  onCommand?: (result: CommandResult, intent: PlayerIntent) => void;
   /** Fired after a successful player send (optional follow-send). */
   onSend?: () => void;
   /** When false, ignore send / plant / selection gestures. */
@@ -366,7 +372,12 @@ export function bindGameplay(opts: {
         }
       } else if (wasDragging && fromId !== null && toId !== null) {
         const result = sendSeedlings(world, fromId, toId, sendN, 'player');
-        onCommand?.(result);
+        onCommand?.(result, {
+          kind: 'send',
+          fromId,
+          toId,
+          count: sendN,
+        });
         if (result.ok) {
           audio.send(sendN, panFromEvent(e));
           onSend?.();

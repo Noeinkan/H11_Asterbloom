@@ -47,10 +47,49 @@ function perfBlock(perf: PerfProbe): string {
  * each planted tree, its live rootIntake breakdown. Read-only; the full HUD
  * inspector rewrite is a separate plan.
  */
-export function createDebugOverlay(host: HTMLElement): DebugOverlay {
+export function createDebugOverlay(
+  host: HTMLElement,
+  opts: {
+    /**
+     * Returns the current match's replay log as JSON, or null when the match
+     * cannot produce one. Omit to leave the export control out entirely.
+     */
+    onCopyReplay?: () => string | null;
+  } = {},
+): DebugOverlay {
   const root = document.createElement('div');
   root.className = 'hud-debug';
   root.hidden = true;
+
+  // sync() rewrites the body wholesale, so anything with a listener lives
+  // outside it — otherwise the button would be replaced every refresh.
+  const body = document.createElement('div');
+  root.appendChild(body);
+
+  let copyBtn: HTMLButtonElement | null = null;
+  if (opts.onCopyReplay) {
+    copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.className = 'hud-debug-action';
+    copyBtn.textContent = 'Copy replay';
+    copyBtn.addEventListener('click', () => {
+      const json = opts.onCopyReplay?.() ?? null;
+      if (!json) {
+        copyBtn!.textContent = 'No replay';
+        return;
+      }
+      void navigator.clipboard
+        ?.writeText(json)
+        .then(() => {
+          copyBtn!.textContent = 'Copied';
+        })
+        .catch(() => {
+          copyBtn!.textContent = 'Copy failed';
+        });
+    });
+    root.appendChild(copyBtn);
+  }
+
   host.appendChild(root);
 
   return {
@@ -62,6 +101,8 @@ export function createDebugOverlay(host: HTMLElement): DebugOverlay {
 
     setVisible(visible) {
       root.hidden = !visible;
+      // Reset the label so a second open does not still read "Copied".
+      if (visible && copyBtn) copyBtn.textContent = 'Copy replay';
     },
 
     sync(world, perf) {
@@ -104,7 +145,7 @@ export function createDebugOverlay(host: HTMLElement): DebugOverlay {
         parts.push('</div>');
       }
 
-      root.innerHTML = parts.join('');
+      body.innerHTML = parts.join('');
     },
 
     destroy() {

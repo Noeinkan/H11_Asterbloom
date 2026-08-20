@@ -203,6 +203,13 @@ export function treeVisualScale(radius: number, seed = 0): number {
   return (TREE_TO_ROCK * radius) / TREE_SPINE_HEIGHT + wobble;
 }
 
+/**
+ * Fixed simulation step. The app ticker and the offline `replay()` re-sim are
+ * the only things that drive the world, and both must step at exactly this
+ * rate or a recorded match stops reproducing.
+ */
+export const SIM_DT = 1 / 60;
+
 /** Phase 4 pacing: opening scout, mid wells/chokes, late fights not mopping. */
 export const LOCAL_SEEDLING_CAP = 35;
 /** Player home always starts with this many orbiting seedlings. */

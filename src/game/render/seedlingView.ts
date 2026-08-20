@@ -9,6 +9,11 @@ import {
   type AtlasEntry,
 } from './seedlingAtlas';
 import { inView, type ViewBox } from './viewport';
+import {
+  deathMotesEnabled,
+  getVisualPrefs,
+  hitFlashMs,
+} from './visualPrefs';
 
 /**
  * How many stale atlas entries a single frame may repaint. Matches the rock /
@@ -95,10 +100,13 @@ export class SeedlingLayer {
     const gen = ++this.generation;
     const now = performance.now();
     let refreshBudget = ATLAS_REFRESHES_PER_FRAME;
+    // Read once per sync, not per unit: the pref cannot change mid-loop.
+    const prefs = getVisualPrefs();
+    const flashMs = hitFlashMs(prefs);
 
     for (const s of seedlings.values()) {
       let tracked = this.sprites.get(s.id);
-      const shape = seedlingShape(s);
+      const shape = seedlingShape(s, prefs.factionMarks);
       const key = seedlingShapeKey(shape);
       if (!tracked) {
         const entry = this.atlas.acquire(key, shape, gen);
@@ -130,7 +138,9 @@ export class SeedlingLayer {
       // below reads `seen`, and skipping it off screen would destroy live
       // units and spray death motes where nothing died.
       if (s.hp < tracked.lastHp - 0.01) {
-        tracked.flashUntil = now + 120;
+        // At 0 ms `now < flashUntil` is never true, so the tint path below
+        // simply never lights up — no extra branch at the draw site.
+        tracked.flashUntil = now + flashMs;
       }
       tracked.seen = gen;
       tracked.lastHp = s.hp;
@@ -183,7 +193,7 @@ export class SeedlingLayer {
 
     for (const [id, tracked] of this.sprites) {
       if (tracked.seen === gen) continue;
-      if (tracked.state !== 'plant') {
+      if (tracked.state !== 'plant' && deathMotesEnabled(prefs)) {
         spawnDeathMotes(
           this.motes,
           this.moteLayer,

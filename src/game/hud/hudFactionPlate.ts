@@ -1,4 +1,5 @@
 import type { World } from '../sim/types';
+import { observeHudBarOffset } from './hudBarOffset';
 
 export interface FactionPlate {
   root: HTMLDivElement;
@@ -7,7 +8,6 @@ export interface FactionPlate {
   destroy(): void;
 }
 
-const GAP_PX = 8;
 
 /**
  * Always-visible bottom-left "colony name" plate. Names the player's home
@@ -51,33 +51,16 @@ export function createFactionPlate(
     return '';
   };
 
-  const updateOffset = () => {
-    const safeBottom = parseFloat(
-      getComputedStyle(document.documentElement)
-        .getPropertyValue('--ab-safe-bottom')
-        || '12',
-    ) || 12;
-    let barHeight = 0;
-    if (anchor && anchor.isConnected && !anchor.hidden) {
-      barHeight = anchor.getBoundingClientRect().height;
-    }
-    const total = safeBottom + barHeight + GAP_PX;
-    root.style.setProperty('--ab-plate-bottom', `${total}px`);
-  };
-
-  let resizeObserver: ResizeObserver | null = null;
-  if (typeof ResizeObserver !== 'undefined' && anchor) {
-    resizeObserver = new ResizeObserver(() => updateOffset());
-    resizeObserver.observe(anchor);
-  }
-  window.addEventListener('resize', updateOffset);
+  const offset = observeHudBarOffset(anchor, (px) => {
+    root.style.setProperty('--ab-plate-bottom', `${px}px`);
+  });
 
   return {
     root,
 
     setVisible(visible) {
       root.hidden = !visible;
-      updateOffset();
+      offset.refresh();
     },
 
     sync(world, selectedAsteroidId) {
@@ -88,9 +71,7 @@ export function createFactionPlate(
     },
 
     destroy() {
-      resizeObserver?.disconnect();
-      resizeObserver = null;
-      window.removeEventListener('resize', updateOffset);
+      offset.destroy();
       root.remove();
     },
   };

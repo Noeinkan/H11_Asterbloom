@@ -11,6 +11,20 @@
   --ab-safe-top: max(10px, env(safe-area-inset-top, 0px));
   --ab-safe-left: max(12px, env(safe-area-inset-left, 0px));
   --ab-safe-right: max(12px, env(safe-area-inset-right, 0px));
+  /*
+   * HUD text ladder. Settings scales the whole HUD by rewriting one variable;
+   * every HUD font-size below is a step on this ladder, never a raw px.
+   * The ladder never goes below 1, so the coarse-pointer 44px minimums hold.
+   */
+  --ab-hud-scale: 1;
+  --ab-fs-xs: calc(10px * var(--ab-hud-scale));
+  --ab-fs-sm: calc(11px * var(--ab-hud-scale));
+  --ab-fs-md: calc(12px * var(--ab-hud-scale));
+  --ab-fs-base: calc(13px * var(--ab-hud-scale));
+  --ab-fs-lg: calc(14px * var(--ab-hud-scale));
+  --ab-fs-xl: calc(16px * var(--ab-hud-scale));
+  --ab-fs-2xl: calc(17px * var(--ab-hud-scale));
+  --ab-fs-3xl: calc(18px * var(--ab-hud-scale));
 }
 
 html,
@@ -35,7 +49,7 @@ canvas {
   z-index: 10;
   color: var(--ab-ink-card-soft, rgba(74, 40, 48, 0.72));
   font-family: var(--ab-font);
-  font-size: 13px;
+  font-size: var(--ab-fs-base);
   font-weight: 500;
   line-height: 1.5;
   pointer-events: none;
@@ -54,7 +68,7 @@ canvas {
   background: transparent;
   color: var(--ab-ink, #7a3040);
   font-family: var(--ab-font-display);
-  font-size: 12px;
+  font-size: var(--ab-fs-md);
   font-weight: 600;
   line-height: 1.3;
   cursor: pointer;
@@ -92,7 +106,7 @@ canvas {
   background: var(--ab-bg-card, #0c0b10);
   color: var(--ab-ink-soft, rgba(74, 40, 48, 0.85));
   font-family: var(--ab-font-display);
-  font-size: 17px;
+  font-size: var(--ab-fs-2xl);
   font-weight: 600;
   line-height: 1.45;
   text-align: center;
@@ -118,7 +132,7 @@ canvas {
   background: transparent;
   color: var(--ab-ink, #7a3040);
   font-family: var(--ab-font-display);
-  font-size: 14px;
+  font-size: var(--ab-fs-lg);
   font-weight: 600;
   line-height: 1.3;
   cursor: pointer;
@@ -166,7 +180,7 @@ html[data-boot="field"] .title-overlay {
   padding: 0.15rem 0.5rem;
   border: 1px solid var(--ab-ink-soft, rgba(74, 40, 48, 0.28));
   border-radius: 999px;
-  font-size: 11px;
+  font-size: var(--ab-fs-sm);
   line-height: 1.3;
 }
 
@@ -209,14 +223,14 @@ html[data-boot="field"] .title-overlay {
 .hud-inspector-title strong {
   color: var(--ab-ink, #7a3040);
   font-family: var(--ab-font-display);
-  font-size: 12px;
+  font-size: var(--ab-fs-md);
   font-weight: 700;
   letter-spacing: 0.03em;
   white-space: nowrap;
 }
 
 .hud-inspector-owner {
-  font-size: 11px;
+  font-size: var(--ab-fs-sm);
   font-weight: 500;
   opacity: 0.7;
   letter-spacing: 0.02em;
@@ -234,7 +248,7 @@ html[data-boot="field"] .title-overlay {
 .hud-inspector-stats dt {
   display: inline;
   margin: 0;
-  font-size: 10px;
+  font-size: var(--ab-fs-xs);
   font-weight: 500;
   opacity: 0.65;
 }
@@ -248,14 +262,14 @@ html[data-boot="field"] .title-overlay {
   margin: 0;
   color: var(--ab-ink, #7a3040);
   font-family: var(--ab-font-display);
-  font-size: 11px;
+  font-size: var(--ab-fs-sm);
   font-weight: 700;
 }
 
 .hud-inspector-note,
 .hud-inspector-status {
   margin: 0;
-  font-size: 10px;
+  font-size: var(--ab-fs-xs);
   font-weight: 500;
   line-height: 1.3;
   opacity: 0.78;
@@ -302,7 +316,7 @@ html[data-boot="field"] .title-overlay {
   background: transparent;
   color: var(--ab-ink, #7a3040);
   font-family: var(--ab-font-display);
-  font-size: 12px;
+  font-size: var(--ab-fs-md);
   font-weight: 600;
   line-height: 1.3;
   cursor: pointer;
@@ -347,7 +361,7 @@ html[data-boot="field"] .title-overlay {
   background: transparent;
   color: var(--ab-ink, #7a3040);
   font-family: var(--ab-font-display);
-  font-size: 12px;
+  font-size: var(--ab-fs-md);
   font-weight: 600;
   line-height: 1.3;
   cursor: pointer;
@@ -395,7 +409,7 @@ html[data-boot="field"] .title-overlay {
   min-width: 1.6rem;
   text-align: center;
   font-family: var(--ab-font-display);
-  font-size: 13px;
+  font-size: var(--ab-fs-base);
   font-weight: 700;
   color: var(--ab-ink, #7a3040);
   opacity: 0.9;
@@ -413,7 +427,7 @@ html[data-boot="field"] .title-overlay {
   backdrop-filter: blur(6px);
   color: var(--ab-ink, #7a3040);
   font-family: var(--ab-font-display);
-  font-size: 10px;
+  font-size: var(--ab-fs-xs);
   font-weight: 700;
   line-height: 1.2;
   letter-spacing: 0.04em;
@@ -436,7 +450,7 @@ html[data-boot="field"] .title-overlay {
   backdrop-filter: blur(6px);
   color: var(--ab-ink, #7a3040);
   font-family: var(--ab-font-display);
-  font-size: 12px;
+  font-size: var(--ab-fs-md);
   font-weight: 600;
   text-align: center;
   line-height: 1.35;
@@ -461,7 +475,7 @@ html[data-boot="field"] .title-overlay {
   backdrop-filter: blur(6px);
   color: var(--ab-ink-soft, rgba(74, 40, 48, 0.85));
   font-family: var(--ab-font);
-  font-size: 11px;
+  font-size: var(--ab-fs-sm);
   font-weight: 500;
   line-height: 1.45;
   pointer-events: auto;
@@ -475,13 +489,13 @@ html[data-boot="field"] .title-overlay {
   margin-bottom: 0.35rem;
   color: var(--ab-ink, #7a3040);
   font-family: var(--ab-font-display);
-  font-size: 12px;
+  font-size: var(--ab-fs-md);
   font-weight: 700;
   letter-spacing: 0.04em;
 }
 
 .hud-debug-title span {
-  font-size: 10px;
+  font-size: var(--ab-fs-xs);
   font-weight: 600;
   opacity: 0.55;
 }
@@ -497,6 +511,18 @@ html[data-boot="field"] .title-overlay {
   font-weight: 700;
 }
 
+.hud-debug-action {
+  margin-top: 0.5rem;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid var(--ab-ink-soft, rgba(74, 40, 40, 0.28));
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: var(--ab-fs-xs);
+  cursor: pointer;
+}
+
 .hud-debug-meta {
   font-weight: 600;
   opacity: 0.72;
@@ -507,7 +533,7 @@ html[data-boot="field"] .title-overlay {
   margin: 0.2rem 0 0;
   padding-left: 0.55rem;
   font-weight: 500;
-  font-size: 10px;
+  font-size: var(--ab-fs-xs);
   opacity: 0.82;
 }
 
@@ -560,12 +586,12 @@ html[data-boot="field"] .title-overlay {
     min-height: 44px;
     min-width: 44px;
     padding: 0.45rem 0.85rem;
-    font-size: 14px;
+    font-size: var(--ab-fs-lg);
   }
 
   .hud-send-count {
     min-width: 2rem;
-    font-size: 16px;
+    font-size: var(--ab-fs-xl);
   }
 
   .hud-toast {
@@ -587,7 +613,7 @@ html[data-boot="field"] .title-overlay {
   text-align: left;
   color: var(--ab-ink-soft, rgba(74, 40, 48, 0.85));
   font-family: var(--ab-font);
-  font-size: 14px;
+  font-size: var(--ab-fs-lg);
   font-weight: 500;
   line-height: 1.55;
 }
@@ -611,7 +637,7 @@ html[data-boot="field"] .title-overlay {
 .title-brand {
   margin-bottom: 0.35rem;
   font-family: var(--ab-font-display);
-  font-size: 1.85rem;
+  font-size: calc(1.85rem * var(--ab-hud-scale));
   font-weight: 700;
   letter-spacing: 0.12em;
   color: var(--ab-ink, #7a3040);
@@ -620,7 +646,7 @@ html[data-boot="field"] .title-overlay {
 .title-tag {
   margin-bottom: 1.1rem !important;
   font-family: var(--ab-font);
-  font-size: 14px;
+  font-size: var(--ab-fs-lg);
   font-weight: 500;
   opacity: 0.8;
   color: var(--ab-ink-soft, rgba(74, 40, 48, 0.85)) !important;
@@ -680,11 +706,11 @@ html[data-boot="field"] .title-overlay {
 
 .title-map-body strong {
   font-family: var(--ab-font-display);
-  font-size: 14px;
+  font-size: var(--ab-fs-lg);
 }
 
 .title-map-body span {
-  font-size: 12px;
+  font-size: var(--ab-fs-md);
   font-weight: 500;
   opacity: 0.75;
   line-height: 1.35;
@@ -694,7 +720,7 @@ html[data-boot="field"] .title-overlay {
   margin-top: 0.85rem !important;
   margin-bottom: 0 !important;
   font-family: var(--ab-font);
-  font-size: 12px;
+  font-size: var(--ab-fs-md);
   font-weight: 500;
   opacity: 0.55;
   letter-spacing: 0.06em;
@@ -721,7 +747,7 @@ html[data-boot="field"] .title-overlay {
 .pause-seed {
   margin: 0 0 0.65rem !important;
   font-family: var(--ab-font) !important;
-  font-size: 12px !important;
+  font-size: var(--ab-fs-md) !important;
   font-weight: 500 !important;
   letter-spacing: 0.04em;
   opacity: 0.65;
@@ -739,7 +765,7 @@ html[data-boot="field"] .title-overlay {
 .pause-hint {
   margin: 0.85rem 0 0 !important;
   font-family: var(--ab-font) !important;
-  font-size: 11px !important;
+  font-size: var(--ab-fs-sm) !important;
   font-weight: 500 !important;
   line-height: 1.45 !important;
   opacity: 0.55;
@@ -767,7 +793,7 @@ html[data-boot="field"] .title-overlay {
 .crust-menu-ask {
   margin: 0;
   padding: 0.1rem 0.45rem 0.4rem;
-  font-size: 11px;
+  font-size: var(--ab-fs-sm);
   font-weight: 500;
   letter-spacing: 0.04em;
   opacity: 0.62;
@@ -782,7 +808,7 @@ html[data-boot="field"] .title-overlay {
   background: transparent;
   color: var(--ab-ink, #7a3040);
   font-family: var(--ab-font-display);
-  font-size: 13px;
+  font-size: var(--ab-fs-base);
   font-weight: 600;
   line-height: 1.3;
   cursor: pointer;
@@ -794,7 +820,17 @@ html[data-boot="field"] .title-overlay {
   background: color-mix(in srgb, var(--ab-ink, #7a3040) 12%, transparent);
 }
 
-html.ab-reduced-motion * {
+/*
+ * Reduced motion. The canvas effects are gated in `render/visualPrefs.ts`;
+ * this covers the DOM shell — HUD transitions, overlay fades, and anything
+ * else that animates without carrying game state.
+ */
+html.ab-reduced-motion *,
+html.ab-reduced-motion *::before,
+html.ab-reduced-motion *::after {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
   scroll-behavior: auto !important;
 }
 
@@ -815,8 +851,8 @@ html.ab-reduced-motion * {
 
 .hud-icon-btn {
   pointer-events: auto;
-  width: 1.85rem;
-  height: 1.85rem;
+  width: calc(1.85rem * var(--ab-hud-scale));
+  height: calc(1.85rem * var(--ab-hud-scale));
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -826,7 +862,7 @@ html.ab-reduced-motion * {
   backdrop-filter: blur(6px);
   color: var(--ab-ink, #7a3040);
   font-family: var(--ab-font-display);
-  font-size: 14px;
+  font-size: var(--ab-fs-lg);
   font-weight: 700;
   line-height: 1;
   cursor: pointer;
@@ -845,6 +881,39 @@ html.ab-reduced-motion * {
   opacity: 1;
 }
 
+/*
+ * Minimap. Mirrors the faction plate on the opposite corner and stacks clear
+ * of the bottom bar via the same measured offset. `pointer-events: auto` and
+ * the `.hud-minimap` entry in `isHudControlTarget` are what stop edge-scroll
+ * and empty-space pan from firing through it.
+ */
+.hud-minimap {
+  position: fixed;
+  right: var(--ab-safe-right);
+  bottom: var(--ab-minimap-bottom, calc(var(--ab-safe-bottom) + 5.5rem));
+  z-index: 11;
+  padding: 4px;
+  border: 1px solid var(--ab-ink-soft, rgba(74, 40, 40, 0.28));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--ab-bg-card, #0c0b10) 82%, transparent);
+  backdrop-filter: blur(6px);
+  pointer-events: auto;
+  user-select: none;
+  opacity: 0.9;
+  line-height: 0;
+}
+
+.hud-minimap[hidden] {
+  display: none;
+}
+
+.hud-minimap-canvas {
+  display: block;
+  border-radius: 6px;
+  cursor: crosshair;
+  touch-action: none;
+}
+
 .hud-faction-plate {
   position: fixed;
   left: var(--ab-safe-left);
@@ -861,7 +930,7 @@ html.ab-reduced-motion * {
   backdrop-filter: blur(6px);
   color: var(--ab-ink-soft, rgba(74, 40, 48, 0.78));
   font-family: var(--ab-font-display);
-  font-size: 12px;
+  font-size: var(--ab-fs-md);
   font-weight: 700;
   letter-spacing: 0.18em;
   text-transform: uppercase;
@@ -885,9 +954,9 @@ html.ab-reduced-motion * {
 
 @media (pointer: coarse) {
   .hud-icon-btn {
-    width: 2.6rem;
-    height: 2.6rem;
-    font-size: 18px;
+    width: calc(2.6rem * var(--ab-hud-scale));
+    height: calc(2.6rem * var(--ab-hud-scale));
+    font-size: var(--ab-fs-3xl);
   }
 }
 
@@ -900,7 +969,7 @@ html.ab-reduced-motion * {
   border-radius: 10px;
   padding: 8px 12px;
   font-family: var(--ab-font);
-  font-size: 12px;
+  font-size: var(--ab-fs-md);
   font-weight: 600;
   letter-spacing: 0.02em;
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
@@ -920,13 +989,13 @@ html.ab-reduced-motion * {
 .hud-pocket-tip-kind {
   text-transform: uppercase;
   letter-spacing: 0.14em;
-  font-size: 10px;
+  font-size: var(--ab-fs-xs);
   opacity: 0.7;
 }
 
 .hud-pocket-tip-stock {
   font-variant-numeric: tabular-nums;
-  font-size: 13px;
+  font-size: var(--ab-fs-base);
   font-weight: 700;
 }
 
