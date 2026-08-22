@@ -5,6 +5,7 @@ import {
   FLOWER_POLLEN_OPEN,
   measureRootFeed,
   rootFeedActive,
+  soilFor,
   spawnReadiness,
   treeFlowersWorld,
   treeTipsWorld,
@@ -22,6 +23,10 @@ import {
   ENERGY_SPAWN_INTERVAL,
   LOCAL_SEEDLING_CAP,
   orbitBand,
+  ORBIT_BASE_SPEED,
+  ORBIT_BREEZE_SPREAD,
+  ORBIT_RETROGRADE_CUT,
+  ORBIT_SPEED_SPREAD,
   PLANT_CRUISE_SPEED,
   PLANT_DIVE_ANGLE,
   PLANT_DIVE_SPEED,
@@ -39,6 +44,7 @@ import {
   DIET_SPAWN_BOOST,
   DIET_STAT_GAIN,
   dietaryBias,
+  ROOT_EXTRACT_RATE,
   ROOT_INTAKE_FALLOFF,
   SENTINEL_SPAWN_ENERGY,
   SENTINEL_STARVE_DPS,
@@ -226,6 +232,9 @@ export function computeTreeCoreFeed(
 ): number {
   const scale = treeVisualScale(asteroid.radius, asteroid.seed);
   const pose = plantPose(asteroid, slotIndex, plantAngle);
+  // No soil context on purpose: core feed measures how close the tree's own
+  // taproot gets to the well. A pocket tendril that happens to cross near
+  // the centre on its way elsewhere is not a tap into it.
   const adult = buildAdultTree(treeSeed, scale, pose.dist, pose.surfaceY, kind);
   return measureRootFeed(adult, pose.dist);
 }
@@ -251,7 +260,16 @@ function computeRootTips(
 ): { x: number; y: number }[] {
   const scale = treeVisualScale(asteroid.radius, asteroid.seed);
   const pose = plantPose(asteroid, slotIndex, plantAngle);
-  const adult = buildAdultTree(treeSeed, scale, pose.dist, pose.surfaceY, kind);
+  // Same soil context the renderer passes, so the burrowing tendrils that
+  // are drawn reaching a pocket are the same ones that extract from it.
+  const adult = buildAdultTree(
+    treeSeed,
+    scale,
+    pose.dist,
+    pose.surfaceY,
+    kind,
+    soilFor(asteroid, pose),
+  );
 
   const tips: { x: number; y: number }[] = [];
   const rot = pose.angle + Math.PI / 2;
@@ -270,6 +288,15 @@ function computeRootTips(
 /**
  * Instantaneous extraction from subsurface pockets given pre-baked root tips.
  * Cheap: depends only on current pocket amounts, so it is safe to run per tick.
+ *
+ * A tree taps each pocket through its *best* root connection, not the sum of
+ * every tip that happens to be in the neighbourhood. That keeps the mechanic
+ * legible — burrow a tendril to a pocket and you tap it, and pressure on a
+ * pocket comes from how many trees reached it rather than from how bushy one
+ * tree's root system happened to grow.
+ *
+ * Draw is proportional to what is left, so a pocket settles where extraction
+ * meets its regen instead of being pinned at zero.
  */
 function computeExtraction(
   asteroid: Asteroid,
@@ -287,19 +314,47 @@ function computeExtraction(
     const pr = pocket.radiusT * asteroid.radius;
     const px = Math.cos(pocket.angle) * pr;
     const py = Math.sin(pocket.angle) * pr;
-    let rate = 0;
+    let best = 0;
     for (const tip of tips) {
       const dx = tip.x - px;
       const dy = tip.y - py;
       const d = Math.hypot(dx, dy);
-      rate += (1 - smoothstep(0, falloff, d)) * pocket.amount;
+      const link = 1 - smoothstep(0, falloff, d);
+      if (link > best) best = link;
     }
+    const rate = best * pocket.amount * ROOT_EXTRACT_RATE;
     if (rate > 0) {
       byPocket.set(pocket.id, rate);
       total[pocket.kind] += rate;
     }
   }
   return { total, byPocket };
+}
+
+/**
+ * Per-pocket extraction rate on one rock, summed over every tree standing on
+ * it: pocket id → resource units per second. Read-only view for the HUD's
+ * planet survey, so the panel can mark which pockets roots are actually
+ * tapping without re-deriving the root geometry itself.
+ *
+ * Uses each tree's cached `rootTips`, so a tree that has not been ticked yet
+ * simply contributes nothing rather than paying for a fresh bake here.
+ */
+export function pocketDrainRates(
+  world: World,
+  asteroidId: number,
+): Map<number, number> {
+  const out = new Map<number, number>();
+  const asteroid = world.asteroids.get(asteroidId);
+  if (!asteroid) return out;
+  for (const tree of world.trees.values()) {
+    if (tree.asteroidId !== asteroidId) continue;
+    if (!tree.rootTips) continue;
+    for (const [pid, rate] of computeExtraction(asteroid, tree.rootTips).byPocket) {
+      out.set(pid, (out.get(pid) ?? 0) + rate);
+    }
+  }
+  return out;
 }
 
 /** Aggregated per-kind extraction for a planted tree (for tests + HUD). */
@@ -455,6 +510,31 @@ function orbitFacing(angle: number, orbitSpeed: number): number {
 }
 
 /**
+ * Deterministic per-seed variance in [-1, 1]. Derived from the seedling's
+ * phase, which is drawn from the seeded RNG at spawn and round-trips through
+ * saves, so individuality survives load and replay without extra plumbing.
+ */
+function seedVariance(phase: number, salt: number): number {
+  return Math.sin(phase * salt + salt * 1.7);
+}
+
+/**
+ * Angular rate for one seedling. Stats set the flock's average pace; the
+ * phase term spreads individuals across it and turns a minority retrograde,
+ * so a ring shears and mixes instead of rotating as a single rigid body.
+ */
+function orbitSpeedFor(stats: Stats, phase: number): number {
+  const base = ORBIT_BASE_SPEED + stats.speed / 560;
+  const rate = base * (1 + seedVariance(phase, 2.13) * ORBIT_SPEED_SPREAD);
+  return seedVariance(phase, 3.71) < ORBIT_RETROGRADE_CUT ? -rate : rate;
+}
+
+/** Per-seed multiplier on breeze/bob frequencies, so a flock never pulses in unison. */
+function breezeRate(phase: number): number {
+  return 1 + seedVariance(phase, 1.31) * ORBIT_BREEZE_SPREAD;
+}
+
+/**
  * Polar crust orbit. Inclination is camera-depth only; XY is clamped to the
  * lumpy rim so seeds skim the surface instead of cutting through the hollow.
  */
@@ -579,7 +659,9 @@ function spawnSeedling(world: World, tree: Tree, asteroid: Asteroid): void {
 
   const kind: SeedlingKind = pickSeedlingKind(tree, asteroid);
   const stats = seedStatsFromDiet(asteroid.stats, tree.dietaryBias);
-  const orbitSpeed = 0.28 + stats.speed / 560;
+  // Phase first: it seeds both the drift animation and the per-seed orbit rate.
+  const phase = rng() * Math.PI * 2;
+  const orbitSpeed = orbitSpeedFor(stats, phase);
   const orbitAngle = Math.atan2(tip.y - asteroid.y, tip.x - asteroid.x);
   makeSeedling(world, asteroid, tree.faction, kind, {
     stats,
@@ -591,7 +673,7 @@ function spawnSeedling(world: World, tree: Tree, asteroid: Asteroid): void {
     y: tip.y,
     z: 0,
     facing: tip.angle,
-    phase: rng() * Math.PI * 2,
+    phase,
     orbitBias: range(rng, -5, 7),
     inclination: 0.34 + rng() * 0.28,
     orbitNode: orbitAngle,
@@ -613,14 +695,14 @@ export function spawnOrbiters(
   const asteroid = world.asteroids.get(asteroidId);
   if (!asteroid) return;
   const rng = mulberry32((world.seed ^ asteroidId ^ n) >>> 0);
-  const orbitSpeed = 0.28 + asteroid.stats.speed / 560;
   for (let i = 0; i < n; i++) {
     const angle = (i / n) * Math.PI * 2 + rng() * 0.15;
+    const phase = rng() * Math.PI * 2;
     const orbitRadius =
       rockRadiusAt(asteroid, angle) +
       orbitBand(asteroid.radius) +
       range(rng, -4, 6);
-    const speed = orbitSpeed * (0.88 + rng() * 0.24);
+    const speed = orbitSpeedFor(asteroid.stats, phase);
     const inc = 0.3 + rng() * 0.3;
     const node = angle + range(rng, -0.5, 0.5);
     const p = surfaceOrbitPoint(asteroid, orbitRadius, angle, node, inc);
@@ -633,7 +715,7 @@ export function spawnOrbiters(
       y: p.y,
       z: p.z,
       facing: orbitFacing(angle, speed),
-      phase: rng() * Math.PI * 2,
+      phase,
       orbitBias: range(rng, -5, 7),
       inclination: inc,
       orbitNode: node,
@@ -653,7 +735,7 @@ function enterOrbit(s: Seedling, asteroid: Asteroid): void {
     rockRadiusAt(asteroid, s.angle) + SURFACE_CLEARANCE,
     Math.hypot(s.x - asteroid.x, s.y - asteroid.y),
   );
-  s.orbitSpeed = 0.28 + s.stats.speed / 560;
+  s.orbitSpeed = orbitSpeedFor(s.stats, s.phase);
   if (s.inclination === undefined) {
     s.inclination = 0.28 + Math.abs(Math.sin(s.phase)) * 0.24;
   }
@@ -669,9 +751,11 @@ function applyOrbit(s: Seedling, asteroid: Asteroid, dt: number, time: number): 
   s.angle += s.orbitSpeed * dt;
 
   const ph = s.phase;
+  const bw = breezeRate(ph);
   const breezeR =
-    Math.sin(time * 0.62 + ph) * 5.8 + Math.sin(time * 1.18 + ph * 1.37) * 2.6;
-  const breezeT = Math.sin(time * 0.41 + ph * 0.73) * 0.07;
+    Math.sin(time * 0.62 * bw + ph) * 5.8 +
+    Math.sin(time * 1.18 * bw + ph * 1.37) * 2.6;
+  const breezeT = Math.sin(time * 0.41 * bw + ph * 0.73) * 0.07;
   const a = s.angle + breezeT;
   const floor = rockRadiusAt(asteroid, a) + SURFACE_CLEARANCE;
   const r = Math.max(floor, s.orbitRadius + breezeR);
@@ -682,7 +766,7 @@ function applyOrbit(s: Seedling, asteroid: Asteroid, dt: number, time: number): 
     s.orbitNode ?? a,
     s.inclination ?? 0.3,
   );
-  p.z += Math.sin(time * 0.7 + ph) * 2.4;
+  p.z += Math.sin(time * 0.7 * bw + ph) * 2.4;
 
   const px = s.x;
   const py = s.y;

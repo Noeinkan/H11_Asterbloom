@@ -45,6 +45,13 @@ import {
   type FloraPalette,
   type ScenePalette,
 } from './palette';
+import {
+  CORE_HIT_T,
+  pickResourceAt,
+  pocketHitCircles,
+  type PocketHitCircle,
+  type ResourceHit,
+} from './resourcePick';
 import { paintSoftRing } from './treeView';
 import {
   ambientMotion,
@@ -74,12 +81,15 @@ const LIFE_ANIM_DT = 1 / 12;
 const POCKET_ANIM_DT = 1 / 12;
 const FILM_ANIM_DT = 1 / 12;
 
+
 /**
  * Film inset as a fraction of rock radius — stays near ROCK_SURFACE_INSET.
  * Unused constants from the original film-front model were dropped after the
  * substrate Float32Array took over; the leftover comments document the
  * intent that drove their values if the model is ever revived.
  */
+
+export type { ResourceHit } from './resourcePick';
 
 export class AsteroidView {
   readonly root = new Container();
@@ -95,8 +105,16 @@ export class AsteroidView {
   private grass: Graphics;
   private grassSap: Graphics;
   private pocketsGfx: Graphics;
+  private hoverGfx: Graphics;
   private pocketFlashUntil = new Map<number, number>();
   private pocketLastAmount = new Map<number, number>();
+  /** Which subsurface target the cursor is over, if any. */
+  private hover: ResourceHit | null = null;
+  private hoverKey = '';
+  /** Rock centre in world space, for world→local hit tests. */
+  private originX = 0;
+  private originY = 0;
+  private hitRadius = 0;
   private pollenGfx: Graphics;
   private halo: Graphics;
   /** Non-color owner glyph; empty unless the faction-marks pref is on. */
@@ -144,6 +162,9 @@ export class AsteroidView {
     this.root.position.set(asteroid.x, asteroid.y);
     this.pollenRoot.position.set(asteroid.x, asteroid.y);
     this.pollenRoot.eventMode = 'none';
+    this.originX = asteroid.x;
+    this.originY = asteroid.y;
+    this.hitRadius = asteroid.radius;
 
     this.halo = new Graphics();
     this.root.addChild(this.halo);
@@ -168,6 +189,10 @@ export class AsteroidView {
     this.pocketsGfx = new Graphics();
     this.pocketsGfx.eventMode = 'none';
     this.root.addChild(this.pocketsGfx);
+
+    this.hoverGfx = new Graphics();
+    this.hoverGfx.eventMode = 'none';
+    this.root.addChild(this.hoverGfx);
 
     this.pollenGfx = new Graphics();
     this.pollenGfx.eventMode = 'none';
@@ -221,6 +246,9 @@ export class AsteroidView {
   ): void {
     this.root.position.set(asteroid.x, asteroid.y);
     this.pollenRoot.position.set(asteroid.x, asteroid.y);
+    this.originX = asteroid.x;
+    this.originY = asteroid.y;
+    this.hitRadius = asteroid.radius;
     let plantKey = `${plantableSlots.size}`;
     for (const i of plantableSlots) plantKey += `,${i}`;
     const shieldKey = `${Math.round(asteroid.shield)}/${Math.round(asteroid.maxShield)}`;
@@ -405,36 +433,75 @@ export class AsteroidView {
    *   - energy:  four short spikes (spark)
    * All rendered at low alpha so the layer reads as a hint, not an icon.
    */
-  private pickPocketCache: {
-    id: number;
-    x: number;
-    y: number;
-    r: number;
-    kind: 'mineral' | 'water' | 'energy';
-  }[] = [];
+  private pickPocketCache: PocketHitCircle[] = [];
 
-  pickPocket(worldX: number, worldY: number): { pocketId: number; asteroidId: number } | null {
-    for (const p of this.pickPocketCache) {
-      const dx = p.x - worldX;
-      const dy = p.y - worldY;
-      if (dx * dx + dy * dy <= p.r * p.r) {
-        return { pocketId: p.id, asteroidId: this.asteroidId };
-      }
+  /** What the cursor is over on this rock, in world coordinates. */
+  pickResource(worldX: number, worldY: number): ResourceHit | null {
+    return pickResourceAt(
+      {
+        asteroidId: this.asteroidId,
+        x: this.originX,
+        y: this.originY,
+        radius: this.hitRadius,
+        pockets: this.pickPocketCache,
+      },
+      worldX,
+      worldY,
+    );
+  }
+
+  /**
+   * Ring the hovered pocket or core so the cursor has something to land on.
+   * Kept in its own `Graphics` layer: hover changes at pointer rate, while
+   * the pocket orbs themselves only rebuild at `POCKET_ANIM_DT`.
+   */
+  setHover(hit: ResourceHit | null): void {
+    const key =
+      hit && hit.asteroidId === this.asteroidId && hit.target !== 'body'
+        ? hit.target === 'pocket'
+          ? `p${hit.pocketId}`
+          : 'core'
+        : '';
+    if (key === this.hoverKey) return;
+    this.hoverKey = key;
+    this.hover = key === '' ? null : hit;
+    this.paintHover();
+  }
+
+  private paintHover(): void {
+    const g = this.hoverGfx;
+    g.clear();
+    const hit = this.hover;
+    if (!hit) return;
+    if (hit.target === 'body') return;
+    if (hit.target === 'core') {
+      const r = this.hitRadius * CORE_HIT_T;
+      g.circle(0, 0, r);
+      g.stroke({ width: 1.6, color: this.pal.coreWhite, alpha: 0.5 });
+      g.circle(0, 0, r * 0.72);
+      g.stroke({ width: 1, color: this.pal.core, alpha: 0.35 });
+      return;
     }
-    return null;
+    const p = this.pickPocketCache.find((c) => c.id === hit.pocketId);
+    if (!p) return;
+    g.circle(p.x, p.y, p.r);
+    g.stroke({
+      width: 1.6,
+      color: resourceKindHex(p.kind, this.pal),
+      alpha: 0.75,
+    });
+    g.circle(p.x, p.y, p.r * 1.28);
+    g.stroke({
+      width: 1,
+      color: resourceKindHex(p.kind, this.pal),
+      alpha: 0.28,
+    });
   }
 
   private rebuildPocketCache(asteroid: Asteroid): void {
-    this.pickPocketCache.length = 0;
-    for (const pocket of asteroid.pockets) {
-      this.pickPocketCache.push({
-        id: pocket.id,
-        x: Math.cos(pocket.angle) * pocket.radiusT * asteroid.radius,
-        y: Math.sin(pocket.angle) * pocket.radiusT * asteroid.radius,
-        r: asteroid.radius * 0.13,
-        kind: pocket.kind,
-      });
-    }
+    this.pickPocketCache = pocketHitCircles(asteroid);
+    // Orb sizes track the rock radius, so a resize invalidates the ring.
+    if (this.hover) this.paintHover();
   }
 
   retheme(

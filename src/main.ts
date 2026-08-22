@@ -12,6 +12,12 @@ import {
 } from './game/hud/copy';
 import { createPauseHud } from './game/hud/pauseHud';
 import {
+  createPlanetPanel,
+  surveyPlanet,
+  type PlanetPanel,
+  type PlanetSurvey,
+} from './game/hud/planetPanel';
+import {
   clearSave,
   hasSave,
   readSave,
@@ -50,6 +56,7 @@ import {
 import {
   AsteroidView,
   EMPTY_PLANTABLE,
+  type ResourceHit,
 } from './game/render/asteroidView';
 import { Camera } from './game/render/camera';
 import { GraphView } from './game/render/graphView';
@@ -101,13 +108,19 @@ import {
 } from './game/sim/match';
 import {
   SIM_DT,
+  type Asteroid,
   type Difficulty,
   type FactionId,
   type SeedlingState,
   type Tree,
   type World,
 } from './game/sim/types';
-import { countOrbitingKind, createEmptyWorld, tick } from './game/sim/world';
+import {
+  countOrbitingKind,
+  createEmptyWorld,
+  pocketDrainRates,
+  tick,
+} from './game/sim/world';
 
 const FPS_SAMPLE_MS = 500;
 const DEFAULT_SESSION_SEED = 0xc0a1f00d;
@@ -149,67 +162,6 @@ const DEGRADE_SAMPLES = 4;
  */
 const RESTORE_FPS = 58;
 const RESTORE_SAMPLES = 20;
-
-/**
- * Lightweight DOM tooltip that follows the cursor and shows the resource
- * kind + remaining amount for a hovered pocket. Always present in the DOM;
- * toggled via `data-visible` so it doesn't fight render order.
- */
-interface PocketTooltip {
-  show(
-    screenX: number,
-    screenY: number,
-    payload: {
-      kind: 'mineral' | 'water' | 'energy';
-      amount: number;
-      maxAmount: number;
-    },
-  ): void;
-  hide(): void;
-  destroy(): void;
-}
-
-function createPocketTooltip(host: HTMLElement): PocketTooltip {
-  const root = document.createElement('div');
-  root.className = 'hud-pocket-tip';
-  root.dataset.visible = 'false';
-  root.innerHTML =
-    '<span class="hud-pocket-tip-kind"></span>' +
-    '<span class="hud-pocket-tip-stock"></span>' +
-    '<span class="hud-pocket-tip-bar"><span class="hud-pocket-tip-bar-fill"></span></span>';
-  host.appendChild(root);
-  const kindEl = root.querySelector<HTMLElement>('.hud-pocket-tip-kind')!;
-  const stockEl = root.querySelector<HTMLElement>('.hud-pocket-tip-stock')!;
-  const fillEl = root.querySelector<HTMLElement>('.hud-pocket-tip-bar-fill')!;
-  const KIND_LABEL: Record<'mineral' | 'water' | 'energy', string> = {
-    mineral: 'Mineral',
-    water: 'Water',
-    energy: 'Energy',
-  };
-  const KIND_COLOR: Record<'mineral' | 'water' | 'energy', string> = {
-    mineral: '#c89464',
-    water: '#84c4d8',
-    energy: '#e8c46f',
-  };
-  return {
-    show(screenX, screenY, payload) {
-      kindEl.textContent = KIND_LABEL[payload.kind];
-      const fill = payload.maxAmount > 0 ? payload.amount / payload.maxAmount : 0;
-      stockEl.textContent = `${payload.amount.toFixed(1)} / ${payload.maxAmount.toFixed(1)}`;
-      fillEl.style.width = `${Math.min(100, fill * 100).toFixed(1)}%`;
-      fillEl.style.background = KIND_COLOR[payload.kind];
-      root.style.left = `${screenX}px`;
-      root.style.top = `${screenY}px`;
-      root.dataset.visible = 'true';
-    },
-    hide() {
-      root.dataset.visible = 'false';
-    },
-    destroy() {
-      root.remove();
-    },
-  };
-}
 
 /**
  * Everything `beginPlayingWorld` normally resets that a resumed match wants
@@ -399,7 +351,10 @@ async function boot(): Promise<void> {
   );
 
   const camera = new Camera();
-  const starfield = new Starfield(world.seed, scene);
+  // The renderer lets the starfield bake its screen-space backdrop into a
+  // texture instead of re-shading five stacked full-screen fills every
+  // frame. Without it the class still works, just unbaked.
+  const starfield = new Starfield(world.seed, scene, app.renderer);
   starfield.resize(app.screen.width, app.screen.height);
   app.stage.addChild(starfield.backdrop);
   app.stage.addChild(camera.world);
@@ -532,7 +487,9 @@ async function boot(): Promise<void> {
   let debugOverlay!: ReturnType<typeof createDebugOverlay>;
   let factionPlate!: ReturnType<typeof createFactionPlate>;
   let hudControls!: ReturnType<typeof createHudControls>;
-  let pocketTip: PocketTooltip | null = null;
+  let planetPanel: PlanetPanel | null = null;
+  /** Last subsurface hit, so its highlight can be cleared off its own rock. */
+  let hoverHit: ResourceHit | null = null;
 
   const syncMuteLabel = () => {
     const muted = !audio.isEnabled();
@@ -608,6 +565,9 @@ async function boot(): Promise<void> {
     abortGameplay = null;
     preview.hide();
     crustMenu?.hide();
+    // The panel outlives the views it points at, so drop its target here.
+    planetPanel?.hide();
+    hoverHit = null;
     for (const view of asteroidViews.values()) view.destroy();
     asteroidViews.clear();
     for (const view of treeViews.values()) view.destroy();
@@ -982,7 +942,7 @@ async function boot(): Promise<void> {
   debugOverlay = createDebugOverlay(host, {
     onCopyReplay: () => (replayLog ? encodeReplay(replayLog) : null),
   });
-  pocketTip = createPocketTooltip(host);
+  planetPanel = createPlanetPanel(host);
 
   factionPlate = createFactionPlate(host, sessionHud.root.querySelector('.hud-bar'));
   minimap = createMinimapHud({
@@ -1032,52 +992,75 @@ async function boot(): Promise<void> {
   syncMuteLabel();
   pauseHud.setFollowSend(followSendEnabled);
 
-  // Pocket tooltip — separate pointermove so we don't interfere with the
-  // gameplay click handler. Runs in capture phase so we can react even when
-  // gameplay already received the event.
-  const onPocketHover = (e: PointerEvent) => {
-    if (!pocketTip) return;
+  const buildSurvey = (asteroid: Asteroid, hit: ResourceHit): PlanetSurvey => {
+    let treesPlanted = 0;
+    for (const tree of world.trees.values()) {
+      if (tree.asteroidId === asteroid.id) treesPlanted += 1;
+    }
+    return surveyPlanet(
+      asteroid,
+      pocketDrainRates(world, asteroid.id),
+      treesPlanted,
+      hit.target === 'pocket'
+        ? { target: 'pocket', pocketId: hit.pocketId }
+        : hit.target === 'core'
+          ? { target: 'core' }
+          : null,
+    );
+  };
+
+  const clearPlanetHover = () => {
+    planetPanel?.hide();
+    if (!hoverHit) return;
+    asteroidViews.get(hoverHit.asteroidId)?.setHover(null);
+    hoverHit = null;
+  };
+
+  /**
+   * Planet survey on hover. Its own pointermove listener so it never
+   * interferes with the gameplay click handler — this only reads.
+   *
+   * The panel opens for the whole rock, anywhere on the disc, and marks
+   * whichever subsurface target the cursor happens to be over. That is what
+   * makes the pocket orbs and the core well reachable: the player aims at a
+   * planet, not at a 6-pixel orb.
+   */
+  const onPlanetHover = (e: PointerEvent) => {
+    if (!planetPanel) return;
     if (sessionMode !== 'playing') {
-      pocketTip.hide();
+      clearPlanetHover();
       return;
     }
     const rect = app.canvas.getBoundingClientRect();
-    const screenX = e.clientX - rect.left;
-    const screenY = e.clientY - rect.top;
-    const w = camera.screenToWorld(screenX, screenY);
-    let hit: { pocketId: number; asteroidId: number } | null = null;
+    const w = camera.screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+    let hit: ResourceHit | null = null;
     for (const view of asteroidViews.values()) {
-      const found = view.pickPocket(w.x, w.y);
-      if (found) {
+      const found = view.pickResource(w.x, w.y);
+      if (!found) continue;
+      // A precise target beats bare crust on an overlapping neighbour, so
+      // keep scanning while all we have is a body hit.
+      if (found.target !== 'body') {
         hit = found;
         break;
       }
+      hit ??= found;
     }
-    if (!hit) {
-      pocketTip.hide();
+    const asteroid = hit ? world.asteroids.get(hit.asteroidId) : undefined;
+    if (!hit || !asteroid) {
+      clearPlanetHover();
       return;
     }
-    const a = world.asteroids.get(hit.asteroidId);
-    if (!a) {
-      pocketTip.hide();
-      return;
+    if (hoverHit && hoverHit.asteroidId !== hit.asteroidId) {
+      asteroidViews.get(hoverHit.asteroidId)?.setHover(null);
     }
-    const p = a.pockets.find((pk) => pk.id === hit!.pocketId);
-    if (!p) {
-      pocketTip.hide();
-      return;
-    }
-    // Position the tooltip relative to the viewport; the CSS centers
-    // horizontally and lifts above the cursor, so just feed it the
-    // local-coords top-left.
-    pocketTip.show(e.clientX, e.clientY, {
-      kind: p.kind,
-      amount: p.amount,
-      maxAmount: p.maxAmount,
-    });
+    hoverHit = hit;
+    asteroidViews.get(hit.asteroidId)?.setHover(hit);
+    planetPanel.show(e.clientX, e.clientY, buildSurvey(asteroid, hit));
   };
-  app.canvas.addEventListener('pointermove', onPocketHover);
-  app.canvas.addEventListener('pointerleave', () => pocketTip?.hide());
+  app.canvas.addEventListener('pointermove', onPlanetHover);
+  app.canvas.addEventListener('pointerleave', clearPlanetHover);
+
+
 
   if (isFieldBoot()) {
     startSkirmish('normal', parseSeedFromHash() ?? DEFAULT_SESSION_SEED);

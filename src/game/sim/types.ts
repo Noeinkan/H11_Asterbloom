@@ -231,6 +231,22 @@ export const PLANT_CRUISE_SPEED = 2.15;
 /** Start the inward dip once this close to the slot bearing (radians). */
 export const PLANT_DIVE_ANGLE = 0.2;
 export const ORBIT_BAND = 16;
+/** Baseline orbital angular rate before per-seed stat and phase variance. */
+export const ORBIT_BASE_SPEED = 0.28;
+/**
+ * Fraction of the baseline rate that per-seed variance may add or remove.
+ * Without a spread every seedling on a rock turns at the identical rate, so
+ * the ring rotates as one rigid body and clusters never drift apart.
+ */
+export const ORBIT_SPEED_SPREAD = 0.22;
+/**
+ * Per-seed variance below this threshold orbits retrograde. Variance is a
+ * sine of the seedling phase, so this cuts roughly a quarter of a flock the
+ * other way around the rock.
+ */
+export const ORBIT_RETROGRADE_CUT = -0.75;
+/** Fraction by which per-seed breeze and bob frequencies may differ. */
+export const ORBIT_BREEZE_SPREAD = 0.24;
 
 export function orbitBand(radius: number): number {
   return ORBIT_BAND + radius * 0.14;
@@ -283,6 +299,16 @@ export const POCKET_AMOUNT_ENERGY: Record<ResourceRole, number> = {
 export const POCKET_REGEN_PER_SEC = 0.25;
 /** Falloff (in radiusT units) over which a root tip draws from a pocket. */
 export const ROOT_INTAKE_FALLOFF = 0.85;
+/**
+ * Share of a pocket's remaining stock one fully-connected root tip draws
+ * per second. Extraction is proportional to what is left, so a pocket
+ * settles where drain meets `POCKET_REGEN_PER_SEC` instead of being pinned
+ * at zero: one tip on a 14-unit pocket pulls ~0.7/s at first and levels off
+ * near a third of capacity, and each extra tree on the rock pushes that
+ * equilibrium down. Sized against regen — raising it starves rocks, and
+ * lowering it makes reserves stop mattering.
+ */
+export const ROOT_EXTRACT_RATE = 0.05;
 /** Core reservoir drain per tree per second. */
 export const CORE_FEED_DRAIN = 0.04;
 /** Weight of each resource kind when converted into coreEnergy. */

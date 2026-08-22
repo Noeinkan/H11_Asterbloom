@@ -1,4 +1,11 @@
-import { Container, FillGradient, Graphics } from 'pixi.js';
+import {
+  Container,
+  FillGradient,
+  Graphics,
+  RenderTexture,
+  Sprite,
+  type Renderer,
+} from 'pixi.js';
 import { mulberry32 } from '../sim/rng';
 import { getVisualPrefs } from './visualPrefs';
 import {
@@ -13,6 +20,23 @@ import {
 /** Breath offset quantum, in normalized gradient coords. */
 const DRIFT_STEP = 0.01;
 
+/**
+ * Resolution the backdrop is baked at, as a fraction of the viewport.
+ *
+ * The backdrop is five stacked full-screen fills (base, band, two blooms,
+ * vignette). Kept as live `Graphics` they were re-shaded *every frame* —
+ * roughly six screens of alpha-blended, texture-sampled fragments before a
+ * single asteroid was drawn, which is exactly the fill-rate wall `PerfProbe`
+ * reports as GPU-bound. They only actually change on the hue-bucket / breath
+ * cadence (~1 Hz), so they are rendered once into a texture and blitted as a
+ * single opaque quad instead.
+ *
+ * Half resolution because the backdrop is nothing but smooth gradients: the
+ * bilinear upscale is indistinguishable from shading it at full size, and it
+ * makes the (rare) re-bake a quarter of the cost.
+ */
+const BAKE_SCALE = 0.5;
+
 function quantize(v: number, step: number): number {
   return Math.round(v / step) * step;
 }
@@ -26,12 +50,28 @@ type Star = { x: number; y: number; size: number; alpha: number };
  * layer B is the incoming theme (alpha = mix). When `mix` is 0 or 1 the
  * inactive layer is fully transparent so we still pay one Graphics clear per
  * frame, but no fill cost.
+ *
+ * The screen-space backdrop is not drawn live: it is baked into a texture
+ * whenever it changes and blitted as one sprite. See `BAKE_SCALE`.
  */
 export class Starfield {
   /** Screen-space void. Add to the stage, behind the camera. */
-  readonly backdrop = new Graphics();
+  readonly backdrop = new Container();
   /** World-space nebulae and stars. */
   readonly root = new Container();
+  /**
+   * Bake source. Never added to the stage: it is drawn into `bakeTex` on the
+   * frames the backdrop actually changes, and `backdropSprite` is what the
+   * stage sees. Without a renderer (headless tests) it *is* the backdrop.
+   */
+  private readonly paint = new Graphics();
+  private readonly backdropSprite = new Sprite();
+  private readonly renderer: Renderer | null;
+  private bakeTex: RenderTexture | null = null;
+  private bakeDirty = true;
+  /** Size the backdrop is painted at — the bake texture's, not the screen's. */
+  private paintW = 1;
+  private paintH = 1;
   private nebulaA = new Graphics();
   private nebulaB = new Graphics();
   private starsFar = new Graphics();
@@ -58,12 +98,15 @@ export class Starfield {
    */
   private readonly gradientCache = new GradientCache();
 
-  constructor(seed: number, scene: ScenePalette) {
+  constructor(seed: number, scene: ScenePalette, renderer: Renderer | null = null) {
     this.scene = scene;
+    this.renderer = renderer;
     this.themeA = scene.theme ?? 'void';
     this.themeB = this.themeA;
     this.backdrop.eventMode = 'none';
     this.root.eventMode = 'none';
+    this.backdropSprite.visible = false;
+    this.backdrop.addChild(renderer ? this.backdropSprite : this.paint);
     this.root.addChild(this.nebulaA, this.nebulaB, this.starsFar, this.starsNear);
     const layout = layoutSky(seed);
     this.clouds = layout.clouds;
@@ -75,7 +118,8 @@ export class Starfield {
   resize(width: number, height: number): void {
     this.viewW = Math.max(1, width);
     this.viewH = Math.max(1, height);
-    paintBackdropForTheme(this.backdrop, this.viewW, this.viewH, this.scene, this.themeB, 1, this.gradientCache);
+    this.resizeBake();
+    this.repaintBackdrop();
   }
 
   /**
@@ -108,7 +152,7 @@ export class Starfield {
     this.themeA = themeA;
     this.themeB = themeB;
     this.mix = newMix;
-    paintBackdropForTheme(this.backdrop, this.viewW, this.viewH, scene, themeB, 1, this.gradientCache);
+    this.repaintBackdrop();
     paintNebulaeForTheme(this.nebulaA, this.clouds, scene, themeA, 1 - this.mix);
     paintNebulaeForTheme(this.nebulaB, this.clouds, scene, themeB, this.mix);
     paintStars(this.starsFar, this.farStars, scene.mist);
@@ -140,20 +184,89 @@ export class Starfield {
     const slow = t * 0.05; // ≈ 20s per cycle; never distracting
     const dx = still ? 0 : quantize(Math.cos(slow) * 0.06, DRIFT_STEP);
     const dy = still ? 0 : quantize(Math.sin(slow * 0.8) * 0.04, DRIFT_STEP);
-    if (!this.gradientCache.setDrift(dx, dy)) return;
-    paintBackdropForTheme(
-      this.backdrop,
-      this.viewW,
-      this.viewH,
-      this.scene,
-      this.themeB,
-      1,
-      this.gradientCache,
-    );
+    if (this.gradientCache.setDrift(dx, dy)) this.repaintBackdrop();
+    this.flushBake();
+  }
+
+  /**
+   * (Re)allocate the bake texture for the current viewport and stretch the
+   * sprite back over it. Returns early when the size is unchanged so a
+   * resize event that only moves the window costs nothing.
+   */
+  private resizeBake(): void {
+    if (!this.renderer) {
+      this.paintW = this.viewW;
+      this.paintH = this.viewH;
+      return;
+    }
+    const w = Math.max(1, Math.ceil(this.viewW * BAKE_SCALE));
+    const h = Math.max(1, Math.ceil(this.viewH * BAKE_SCALE));
+    if (!this.bakeTex || this.bakeTex.width !== w || this.bakeTex.height !== h) {
+      this.bakeTex?.destroy(true);
+      this.bakeTex = RenderTexture.create({
+        width: w,
+        height: h,
+        resolution: 1,
+        antialias: false,
+      });
+      this.backdropSprite.texture = this.bakeTex;
+      this.paintW = w;
+      this.paintH = h;
+    }
+    // Always re-stretch: `ceil` means two nearby viewport widths can share a
+    // texture size while still needing different sprite scales.
+    this.backdropSprite.width = this.viewW;
+    this.backdropSprite.height = this.viewH;
+  }
+
+  /**
+   * Re-shade the backdrop into the bake source and queue a bake.
+   *
+   * Both themes are stacked here, the same way the nebula layers are: the
+   * outgoing theme lays down an opaque ground, the incoming one is composited
+   * over it at `mix`. The backdrop used to be painted from `themeB` alone at
+   * full alpha, which left the sky's wash a whole theme *ahead* of the
+   * nebulae, the stars and `scene.theme` — and cut to the next one instantly
+   * at each slot boundary instead of fading. Painting A first also keeps the
+   * result opaque at every `mix`, which stacking both at partial alpha would
+   * not.
+   */
+  private repaintBackdrop(): void {
+    const w = this.paintW;
+    const h = this.paintH;
+    this.paint.clear();
+    paintBackdropForTheme(this.paint, w, h, this.scene, this.themeA, 1, this.gradientCache);
+    if (this.mix > 0.001) {
+      paintBackdropForTheme(this.paint, w, h, this.scene, this.themeB, this.mix, this.gradientCache);
+    }
+    this.bakeDirty = true;
+  }
+
+  /**
+   * Push the bake source into the texture, at most once per change.
+   *
+   * Only `tick()` calls this, and only from the ticker, for two reasons:
+   * user ticker callbacks run at NORMAL priority and the application's own
+   * render at LOW, so the bake always lands before the frame that reads it;
+   * and `resize()` can arrive from inside `renderer.resize()` — the adaptive
+   * backbuffer calls it mid-tick — where re-entering the renderer would not
+   * be safe. Everything else just marks the bake dirty and waits a frame.
+   */
+  private flushBake(): void {
+    const target = this.bakeTex;
+    if (!this.bakeDirty || !this.renderer || !target) return;
+    this.bakeDirty = false;
+    this.renderer.render({ container: this.paint, target, clear: true });
+    // A RenderTexture holds undefined contents until something is drawn into
+    // it, so the sprite stays hidden until the first bake lands. Before that
+    // the stage shows the renderer's background color, not GPU garbage.
+    this.backdropSprite.visible = true;
   }
 
   destroy(): void {
     this.gradientCache.destroy();
+    this.bakeTex?.destroy(true);
+    this.bakeTex = null;
   }
 }
 
@@ -206,7 +319,15 @@ function clamp01(v: number): number {
 /**
  * Backdrop per theme. Layered like a depth stack (per `radial-gradient`
  * best practice): base color → ambient band → bloom → soft vignette.
- * Every layer ends on the base color so no layer shows a hard edge.
+ * The band and the vignette cover the whole surface; the blooms are shapes,
+ * so they feather their alpha to 0 at the rim rather than ending on a color
+ * (see `bloomStops`) — otherwise the shape outlines itself.
+ *
+ * `w`/`h` are the *bake* size, not the viewport: every position here is a
+ * fraction of them, so the picture is identical at any bake scale.
+ *
+ * The caller owns `g.clear()`, because two themed passes are stacked into
+ * one surface during a crossfade.
  *
  * Each gradient layer is wrapped in a try/catch that falls back to a flat
  * tint if Pixi's gradient rasterizer fails on this browser/GPU. Without
@@ -222,7 +343,6 @@ function paintBackdropForTheme(
   alpha: number,
   cache: GradientCache,
 ): void {
-  g.clear();
   if (alpha <= 0.001) return;
   const base = baseBackdropColor(scene, theme);
 
@@ -378,16 +498,52 @@ function cloudTint(scene: ScenePalette, theme: BackgroundTheme, cloud: Cloud): H
 }
 
 /**
- * Each wash now paints a soft radial bloom (one `circle` filled with a
- * radial gradient that fades to the base color) instead of two stacked
- * filled discs. That removes the visible disc edges that read as "rings".
+ * Stops for a soft bloom: a bright `peak` plateau, a fade down to `edge`,
+ * then a fully transparent tail.
  *
- * Every bloom is sized so its outer edge falls outside the screen, and
- * every gradient uses a multi-stop falloff that ends on `bgB` (the
- * brightest palette field) instead of the near-black `bgA`. That gives
- * the bloom a real highlight peak — fading to black would just disappear.
- * Blooms are flagged `driftable` so the ambient breath in `tick()` can
- * nudge their centers without re-rasterizing the texture.
+ * The transparent tail is the part that matters. A bloom used to end on an
+ * opaque `bgA`, which only hides the shape's outline if `bgA` happens to
+ * equal the pixels already underneath — and it never does, because the base
+ * fill, the band and any earlier bloom have all painted there first. Drawn at
+ * partial alpha, that mismatch composites as a hard step exactly along the
+ * circle or ellipse, which is what read as a stray "ellipse" in the sky.
+ * Fading the *alpha* to 0 instead makes the rim a no-op against whatever is
+ * beneath it, so a bloom can be smaller than the screen without outlining
+ * itself.
+ *
+ * Blooms are still flagged `driftable` so the ambient breath in `tick()` can
+ * nudge their centers.
+ */
+export function bloomStops(peak: Hex, edge: Hex, plateau = 0.55): ColorStop[] {
+  return [
+    { offset: 0, color: peak },
+    { offset: plateau, color: peak },
+    { offset: 0.86, color: edge },
+    { offset: 1, color: edge, alpha: 0 },
+  ];
+}
+
+/**
+ * Stops for an aurora band: a highlight plateau that feathers to nothing at
+ * both ends of the gradient axis, for the same reason as `bloomStops`.
+ */
+export function bandStops(peak: Hex, edge: Hex): ColorStop[] {
+  return [
+    { offset: 0, color: edge, alpha: 0 },
+    { offset: 0.18, color: edge },
+    { offset: 0.4, color: peak },
+    { offset: 0.6, color: peak },
+    { offset: 0.82, color: edge },
+    { offset: 1, color: edge, alpha: 0 },
+  ];
+}
+
+/**
+ * Each wash paints soft radial blooms (one shape filled with a radial
+ * gradient) instead of stacked filled discs, so there are no disc edges to
+ * read as "rings", and every gradient peaks on `bgB` (the brightest palette
+ * field) rather than the near-black `bgA` — fading to black would just
+ * disappear.
  */
 function paintVoidWash(
   g: Graphics,
@@ -400,11 +556,7 @@ function paintVoidWash(
   // Primary bloom: the scene's main hue, faded into bgA.
   const primary = cache.radial(
     `void-primary`,
-    [
-      { offset: 0, color: scene.bgB },
-      { offset: 0.55, color: scene.bgB },
-      { offset: 1, color: scene.bgA },
-    ],
+    bloomStops(scene.bgB, scene.bgA),
     true,
   );
   g.circle(w * 0.5, h * 0.46, Math.max(w, h) * 0.85);
@@ -414,16 +566,18 @@ function paintVoidWash(
   // the wash shows two distinct color bands instead of one monochrome
   // gradient. This is what makes the void feel like deep space rather
   // than a single flat color.
+  //
+  // Its left and lower rim used to sit well inside the viewport (spanning
+  // x 0.25w–1.25w, y −0.03h–0.67h), so the shape outlined itself across the
+  // upper half of the sky. It now feathers to transparent (`bloomStops`) and
+  // reaches further past three of the four edges, so only the highlight is
+  // ever visible.
   const accent = cache.radial(
     `void-accent`,
-    [
-      { offset: 0, color: scene.mist },
-      { offset: 0.55, color: scene.mist },
-      { offset: 1, color: scene.bgA },
-    ],
+    bloomStops(scene.mist, scene.bgA, 0.34),
     true,
   );
-  g.ellipse(w * 0.75, h * 0.32, w * 0.5, h * 0.35);
+  g.ellipse(w * 0.78, h * 0.28, w * 0.62, h * 0.62);
   g.fill({ fill: accent, alpha: 0.5 * alpha });
 }
 
@@ -438,11 +592,7 @@ function paintPaperWash(
   // Soft inner highlight toward the upper third where the "sun" would be.
   const highlight = cache.radial(
     `paper-high`,
-    [
-      { offset: 0, color: scene.bgB },
-      { offset: 0.5, color: scene.bgB },
-      { offset: 1, color: scene.bgA },
-    ],
+    bloomStops(scene.bgB, scene.bgA, 0.5),
     true,
   );
   g.circle(w * 0.55, h * 0.3, Math.max(w, h) * 0.9);
@@ -451,11 +601,7 @@ function paintPaperWash(
   // Cooler counter-glow toward the lower-left for depth.
   const shadow = cache.radial(
     `paper-shadow`,
-    [
-      { offset: 0, color: scene.bgC },
-      { offset: 0.5, color: scene.bgB },
-      { offset: 1, color: scene.bgA },
-    ],
+    bloomStops(scene.bgC, scene.bgA, 0.5),
     true,
   );
   g.circle(w * 0.4, h * 0.72, Math.max(w, h) * 0.75);
@@ -474,21 +620,11 @@ function paintAuroraWashes(
   // fades to bgA at the long edges so the band feathers into the wash
   // without a visible boundary. Centered on bgB so it reads as a
   // highlight band, not a darkening.
-  const mist = cache.linear(`aurora-mist`, [
-    { offset: 0, color: scene.bgA },
-    { offset: 0.35, color: scene.bgB },
-    { offset: 0.65, color: scene.bgB },
-    { offset: 1, color: scene.bgA },
-  ]);
+  const mist = cache.linear(`aurora-mist`, bandStops(scene.bgB, scene.bgA));
   g.ellipse(w * 0.4, h * 0.32, w * 0.7, h * 0.18);
   g.fill({ fill: mist, alpha: 0.4 * alpha });
 
-  const dust = cache.linear(`aurora-dust`, [
-    { offset: 0, color: scene.bgA },
-    { offset: 0.35, color: scene.bgC },
-    { offset: 0.65, color: scene.bgC },
-    { offset: 1, color: scene.bgA },
-  ]);
+  const dust = cache.linear(`aurora-dust`, bandStops(scene.bgC, scene.bgA));
   g.ellipse(w * 0.6, h * 0.6, w * 0.75, h * 0.2);
   g.fill({ fill: dust, alpha: 0.32 * alpha });
 }
@@ -505,11 +641,7 @@ function paintNebulaWash(
   // into the wash, but the bright plateau is bgB so it actually shows.
   const core = cache.radial(
     `nebula-core`,
-    [
-      { offset: 0, color: scene.bgB },
-      { offset: 0.55, color: scene.bgB },
-      { offset: 1, color: scene.bgA },
-    ],
+    bloomStops(scene.bgB, scene.bgA),
     true,
   );
   g.circle(w * 0.5, h * 0.55, Math.max(w, h) * 0.85);
@@ -521,7 +653,8 @@ function paintNebulaWash(
     [
       { offset: 0, color: scene.dust },
       { offset: 0.6, color: scene.bgB },
-      { offset: 1, color: scene.bgA },
+      { offset: 0.86, color: scene.bgA },
+      { offset: 1, color: scene.bgA, alpha: 0 },
     ],
     true,
   );
@@ -529,7 +662,11 @@ function paintNebulaWash(
   g.fill({ fill: halo, alpha: 0.22 * alpha });
 }
 
-export type ColorStop = { offset: number; color: Hex };
+/**
+ * A gradient stop. `alpha` defaults to 1; an explicit 0 is how a bloom ends
+ * without drawing an edge — see `bloomStops`.
+ */
+export type ColorStop = { offset: number; color: Hex; alpha?: number };
 
 interface CachedGradient {
   grad: FillGradient;
@@ -628,14 +765,16 @@ export class GradientCache {
 
 export function stopsSig(stops: ColorStop[]): string {
   let sig = '';
-  for (const s of stops) sig += `${s.offset.toFixed(3)}:${s.color.toString(16)};`;
+  for (const s of stops) {
+    sig += `${s.offset.toFixed(3)}:${s.color.toString(16)}@${(s.alpha ?? 1).toFixed(3)};`;
+  }
   return sig;
 }
 
 function writeStops(grad: FillGradient, stops: ColorStop[]): void {
   grad.colorStops.length = 0;
   for (const s of stops) {
-    grad.colorStops.push({ offset: s.offset, color: cssColor(s.color) });
+    grad.colorStops.push({ offset: s.offset, color: cssColor(s.color, s.alpha) });
   }
 }
 
@@ -643,7 +782,14 @@ function writeStops(grad: FillGradient, stops: ColorStop[]): void {
  * `FillGradient.colorStops` expects a CSS-style color string. Our palette
  * stores packed-hex integers (e.g. `0xff40a0`), so convert via the same
  * helper `applySceneToDocument` uses.
+ *
+ * Translucent stops come out as `#rrggbbaa`. Pixi rasterizes the ramp onto a
+ * 2D canvas and uploads it with `premultiply-alpha-on-upload`, so an alpha
+ * stop is honoured end to end.
  */
-function cssColor(hex: Hex): string {
-  return `#${hex.toString(16).padStart(6, '0')}`;
+function cssColor(hex: Hex, alpha = 1): string {
+  const rgb = `#${hex.toString(16).padStart(6, '0')}`;
+  if (alpha >= 1) return rgb;
+  const a = Math.round(Math.max(0, alpha) * 255);
+  return `${rgb}${a.toString(16).padStart(2, '0')}`;
 }

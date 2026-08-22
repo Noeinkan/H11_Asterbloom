@@ -4,8 +4,8 @@ import {
   FLOWER_POLLEN_OPEN,
   growTree,
   rootFeedActive,
+  soilFor,
   treeFlowersWorld,
-  type PocketTarget,
   type TreeGeom,
   type TreeStroke,
 } from '../sim/lsystem';
@@ -279,7 +279,7 @@ export class TreeView {
       polar.dist,
       polar.surfaceY,
       this.kind,
-      pocketsToTreeTargets(asteroid, polar),
+      soilFor(asteroid, polar),
     );
     this.adultKey = key;
     return this.adult;
@@ -838,32 +838,6 @@ function dietTinted(base: number, pal: FloraPalette, tree: Tree, amount: number)
   // floor so a clear bias (0.8) still bleeds through.
   const strength = Math.min(1, (bestShare - 1 / 3) * 1.4 + 0.25) * (tree.maturity < 0.25 ? 0.4 : 1);
   return mixHex(base, tint, amount * strength);
-}
-
-function pocketsToTreeTargets(
-  asteroid: Asteroid,
-  pose: { x: number; y: number; angle: number },
-): PocketTarget[] {
-  const rot = pose.angle + Math.PI / 2;
-  const cos = Math.cos(-rot);
-  const sin = Math.sin(-rot);
-  const ox = pose.x - asteroid.x;
-  const oy = pose.y - asteroid.y;
-  const out: PocketTarget[] = [];
-  for (const pocket of asteroid.pockets) {
-    const pr = pocket.radiusT * asteroid.radius;
-    const tx = Math.cos(pocket.angle) * pr - ox;
-    const ty = Math.sin(pocket.angle) * pr - oy;
-    const lx = tx * cos - ty * sin;
-    const ly = tx * sin + ty * cos;
-    out.push({
-      x: lx,
-      y: ly,
-      depthT: pocket.depthT,
-      kind: pocket.kind,
-    });
-  }
-  return out;
 }
 
 function longestFromCollar(

@@ -960,55 +960,152 @@ html.ab-reduced-motion *::after {
   }
 }
 
-.hud-pocket-tip {
+/* Planet survey panel — subsurface readout on hover. */
+.planet-panel {
   position: fixed;
   z-index: 12;
   pointer-events: none;
+  min-width: 230px;
+  max-width: 300px;
   background: var(--ab-bg-card, #101218);
   color: var(--ab-ink-card, #f2e6d4);
-  border-radius: 10px;
-  padding: 8px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 10px 12px 9px;
   font-family: var(--ab-font);
-  font-size: var(--ab-fs-md);
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
-  transform: translate(-50%, calc(-100% - 12px));
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
   transition: opacity 120ms ease;
   opacity: 0;
-  white-space: nowrap;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.planet-panel[data-visible="true"] {
+  opacity: 1;
+}
+
+.planet-panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.planet-panel-name {
+  font-size: var(--ab-fs-base);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.planet-panel-owner {
+  font-size: var(--ab-fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  opacity: 0.65;
+}
+
+.planet-panel-owner[data-faction="player"] {
+  color: #9fd8a4;
+  opacity: 0.9;
+}
+
+.planet-panel-owner[data-faction="enemy"] {
+  color: #e09a94;
+  opacity: 0.9;
+}
+
+.planet-panel-core,
+.planet-panel-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 4px 6px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+}
+
+/* The subsurface target actually under the cursor. */
+.planet-panel-core[data-focus="true"],
+.planet-panel-item[data-focus="true"] {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
+.planet-panel-item[data-depleted="true"] {
+  opacity: 0.55;
+}
+
+.planet-panel-row-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--ab-fs-xs);
+}
+
+.planet-panel-swatch {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.planet-panel-row-name {
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  opacity: 0.72;
+}
+
+.planet-panel-row-stock {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  opacity: 0.92;
+}
+
+.planet-panel-bar {
+  height: 3px;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.planet-panel-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--ab-ink-card, #f2e6d4);
+  transition: width 140ms ease;
+}
+
+.planet-panel-tap {
+  font-size: var(--ab-fs-xs);
+  letter-spacing: 0.04em;
+  opacity: 0.6;
+}
+
+.planet-panel-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
 
-.hud-pocket-tip[data-visible="true"] {
-  opacity: 1;
-}
-
-.hud-pocket-tip-kind {
-  text-transform: uppercase;
-  letter-spacing: 0.14em;
+.planet-panel-empty {
+  margin: 0;
+  padding: 2px 6px;
   font-size: var(--ab-fs-xs);
-  opacity: 0.7;
+  letter-spacing: 0.04em;
+  opacity: 0.5;
 }
 
-.hud-pocket-tip-stock {
-  font-variant-numeric: tabular-nums;
-  font-size: var(--ab-fs-base);
-  font-weight: 700;
+.planet-panel-foot {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding-top: 6px;
+  font-size: var(--ab-fs-xs);
+  letter-spacing: 0.05em;
+  opacity: 0.6;
 }
 
-.hud-pocket-tip-bar {
-  height: 3px;
-  background: rgba(255, 255, 255, 0.12);
-  border-radius: 2px;
-  overflow: hidden;
-  margin-top: 4px;
-}
-
-.hud-pocket-tip-bar-fill {
-  display: block;
-  height: 100%;
-  border-radius: 2px;
-}

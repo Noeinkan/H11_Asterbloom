@@ -78,10 +78,9 @@ type Pt = { x: number; y: number };
 
 /**
  * A subsurface pocket already converted into tree-local coordinates so the
- * L-system can fork a root toward it. The caller (`treeView.adultGeom`)
- * owns the conversion from asteroid polar (`angle`, `radiusT`) to the
- * tree's frame, so the geometry stays deterministic for `(treeSeed,
- * asteroidSeed)`.
+ * L-system can fork a root toward it. Use `soilFor` to build these from an
+ * asteroid + plant pose so the geometry stays deterministic for
+ * `(treeSeed, asteroidSeed)` and identical between sim and renderer.
  */
 export interface PocketTarget {
   /** Tree-local position of the pocket. */
@@ -94,6 +93,73 @@ export interface PocketTarget {
   depthT: number;
   /** Flag for the renderer (root hue, miner / water / energy tone). */
   kind: 'mineral' | 'water' | 'energy';
+}
+
+/**
+ * Everything the root system needs to know about the rock it is burrowing
+ * through. Tree-local: the rock centre sits at `(0, coreDepth)` by
+ * construction, so only the radius has to travel with the pockets.
+ */
+export interface SoilContext {
+  pockets: PocketTarget[];
+  /** Mean rock radius, tree-local units. Tendrils never breach it. */
+  rockRadius: number;
+}
+
+/**
+ * How far a root will burrow for a pocket, as a multiple of rock radius,
+ * measured from the tendril's anchor on the existing root system. Above
+ * ~1.0 a tree reaches past the core into the far hemisphere; the cap keeps
+ * the far crust out of reach so where a tree is planted still matters.
+ */
+export const POCKET_SEEK_REACH = 1.35;
+
+/** Hard cap on burrowing tendrils per tree, for geometry cost. */
+export const POCKET_SEEK_MAX = 8;
+
+/** Fraction of the rock radius a burrowing tendril may not pass outward. */
+const SEEK_RIM_LIMIT = 0.9;
+
+/**
+ * Convert an asteroid's subsurface pockets into the tree's local frame.
+ * Structurally typed so simulation and renderer can both call it without
+ * dragging the full `Asteroid` type (and its Pixi-free constraints) here.
+ *
+ * The tree frame is rotated by `pose.angle + PI/2` and translated to the
+ * collar, which puts the rock centre at `(0, pose.dist)`.
+ */
+export function soilFor(
+  rock: {
+    x: number;
+    y: number;
+    radius: number;
+    pockets: readonly {
+      angle: number;
+      radiusT: number;
+      depthT: number;
+      kind: 'mineral' | 'water' | 'energy';
+    }[];
+  },
+  pose: { x: number; y: number; angle: number },
+): SoilContext {
+  const rot = pose.angle + Math.PI / 2;
+  const cos = Math.cos(-rot);
+  const sin = Math.sin(-rot);
+  const ox = pose.x - rock.x;
+  const oy = pose.y - rock.y;
+  const pockets: PocketTarget[] = [];
+  for (const pocket of rock.pockets) {
+    const pr = pocket.radiusT * rock.radius;
+    const tx = Math.cos(pocket.angle) * pr - ox;
+    const ty = Math.sin(pocket.angle) * pr - oy;
+    pockets.push({
+      x: tx * cos - ty * sin,
+      y: tx * sin + ty * cos,
+      depthT: pocket.depthT,
+      kind: pocket.kind,
+    });
+  }
+  return { pockets, rockRadius: rock.radius };
 }
 
 /**
@@ -121,7 +187,7 @@ export function buildAdultTree(
   coreDepth = 70,
   surfaceY = 0,
   kind?: TreeKind,
-  pocketTargets?: PocketTarget[],
+  soil?: SoilContext,
 ): TreeGeom {
   const rng = mulberry32(seed >>> 0);
   const strokes: TreeStroke[] = [];
@@ -170,13 +236,13 @@ export function buildAdultTree(
     strokes,
   );
 
-  // Optional pocket-seeking offshoots: thin tendrils that fork from the
-  // main root system and bend toward each subsurface pocket, so the
-  // connection reads as a real root reaching the resource instead of a
-  // painted line across the rock. Caller passes pockets already converted
-  // into tree-local space (= pocketPositionTree()) so the geometry stays
+  // Pocket-seeking offshoots: tendrils that fork from the main root system
+  // and burrow through the soil to each reachable subsurface pocket, so the
+  // connection reads as a root that actually went looking for the resource
+  // instead of a painted line across the rock. Caller passes pockets already
+  // converted into tree-local space (= `soilFor`) so the geometry stays
   // deterministic for a given tree seed + asteroid seed.
-  growPocketSeekers(rng, scale, pocketTargets, rootEmerge, rootSpan, strokes);
+  growPocketSeekers(rng, scale, soil, coreY, rootEmerge, rootSpan, strokes);
 
   const laterals = 2 + Math.floor(rng() * 2);
   spawnLaterals(
@@ -563,94 +629,104 @@ function growNervousRoots(
 }
 
 /**
- * Forks thin root tendrils off the main nervous system toward each
- * subsurface pocket. Each tendril anchors at the closest point of the
- * nearest existing root stroke, then wanders toward the pocket in
- * tree-local space with a gentle S-curve. Emerge / span are staggered so
- * a young tree only shows a few tips and a mature tree reveals all of
- * them. The renderer reads `points` as a normal root stroke, so the
- * tendril inherits the wood→root crossfade and sap flow.
+ * Burrowing root tendrils: for every pocket the tree can reach, fork a
+ * tendril off the nearest point of the existing root system and drive it
+ * through the soil until it touches the pocket.
+ *
+ * Three properties make it read as *searching* rather than as a straight
+ * wire to a known target:
+ *
+ *  - the tendril leaves its anchor on the anchor's own heading and only
+ *    swings onto the pocket bearing as it closes, so the early run wanders;
+ *  - lateral sweep decays with `closeness`, so the wander tightens into a
+ *    lock-on over the last third;
+ *  - `emerge`/`span` scale with distance, so a growing tree visibly reaches
+ *    the near pockets first and is still burrowing toward the far ones at
+ *    high maturity.
+ *
+ * Every point is clamped inside the rock (centre `(0, coreY)`, radius
+ * `rockRadius`), so a tendril crossing the disc never surfaces mid-flight.
+ * The renderer reads `points` as a normal root stroke, so tendrils inherit
+ * the wood→root crossfade and sap flow; the simulation reads their tips as
+ * extraction points, so what you see feeding is what feeds.
  */
 function growPocketSeekers(
   rng: Rng,
   scale: number,
-  pockets: PocketTarget[] | undefined,
+  soil: SoilContext | undefined,
+  coreY: number,
   emerge: number,
   span: number,
   roots: TreeStroke[],
 ): void {
-  if (!pockets || pockets.length === 0) return;
-  const rootFromList = roots.filter((s) => s.kind === 'root');
-  if (rootFromList.length === 0) return;
+  if (!soil || soil.pockets.length === 0) return;
+  const rootStrokes = roots.filter((s) => s.kind === 'root');
+  if (rootStrokes.length === 0) return;
 
-  for (let i = 0; i < pockets.length; i++) {
-    const p = pockets[i]!;
-    let bestDist = Infinity;
-    let bestA: Pt | null = null;
-    let bestB: Pt | null = null;
-    let bestT = 0;
-    for (const s of rootFromList) {
-      const pts = s.points;
-      if (pts.length < 2) continue;
-      for (let k = 0; k < pts.length - 1; k++) {
-        const a = pts[k]!;
-        const b = pts[k + 1]!;
-        const dx = b.x - a.x;
-        const dy = b.y - a.y;
-        const len2 = dx * dx + dy * dy;
-        if (len2 < 1e-6) continue;
-        let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
-        t = Math.min(1, Math.max(0, t));
-        const cx = a.x + dx * t;
-        const cy = a.y + dy * t;
-        const d = Math.hypot(p.x - cx, p.y - cy);
-        if (d < bestDist) {
-          bestDist = d;
-          bestA = a;
-          bestB = b;
-          bestT = t;
-        }
-      }
-    }
-    if (!bestA || !bestB) continue;
-    if (bestDist > 38 * scale) continue;
+  const rockRadius = soil.rockRadius > 0 ? soil.rockRadius : coreY;
+  const maxReach = rockRadius * POCKET_SEEK_REACH;
 
-    const anchor: Pt = {
-      x: bestA.x + (bestB.x - bestA.x) * bestT,
-      y: bestA.y + (bestB.y - bestA.y) * bestT,
-    };
+  // Anchor first, then sort by burrow length: nearest pockets get the
+  // earliest emerge windows, and the per-tree cap spends its budget on the
+  // tendrils the tree can actually complete.
+  const runs: { p: PocketTarget; anchor: Pt; heading: number; reach: number }[] = [];
+  const rimLimit = rockRadius * SEEK_RIM_LIMIT;
+  for (const p of soil.pockets) {
+    // Roots burrow through soil, not through the crust into space. A target
+    // outside the rock is unreachable however close it is to a root.
+    if (Math.hypot(p.x, p.y - coreY) > rimLimit) continue;
+    const anchor = nearestOnStrokes(rootStrokes, p);
+    if (!anchor) continue;
+    const reach = Math.hypot(p.x - anchor.pt.x, p.y - anchor.pt.y);
+    if (reach < 1.5 || reach > maxReach) continue;
+    runs.push({ p, anchor: anchor.pt, heading: anchor.heading, reach });
+  }
+  runs.sort((a, b) => a.reach - b.reach);
 
-    const reach = Math.hypot(p.x - anchor.x, p.y - anchor.y);
-    if (reach < 1.5) continue;
-    const steps = Math.max(6, Math.round(reach / (2.6 * scale)));
+  const count = Math.min(runs.length, POCKET_SEEK_MAX);
+  for (let i = 0; i < count; i++) {
+    const { p, anchor, heading, reach } = runs[i]!;
+    const distNorm = Math.min(1, reach / maxReach);
+
+    const steps = Math.max(8, Math.min(72, Math.round(reach / (2.4 * scale))));
     const phase = rng() * Math.PI * 2;
-    const waves = range(rng, 0.4, 0.8);
-    const amp = range(rng, 0.05, 0.12) * (rng() < 0.5 ? -1 : 1);
+    const waves = range(rng, 0.6, 1.4);
+    const amp = range(rng, 0.10, 0.22) * (rng() < 0.5 ? -1 : 1);
     const pts: Pt[] = [{ x: anchor.x, y: anchor.y }];
     let x = anchor.x;
     let y = anchor.y;
-    let a = Math.atan2(p.y - anchor.y, p.x - anchor.x);
+    // Leave along the parent root, not straight at the pocket: the turn
+    // onto the target bearing is what makes the tendril look like it hunted.
+    let a = heading;
+    const stepLen = reach / steps;
     for (let k = 1; k <= steps; k++) {
       const u = k / steps;
-      const sweep = Math.sin(u * waves * Math.PI * 2 + phase) * amp;
+      const closeness = u * u;
+      const sweep = Math.sin(u * waves * Math.PI * 2 + phase) * amp * (1 - closeness);
       const toPocket = Math.atan2(p.y - y, p.x - x);
-      const closeness = 1 - Math.min(1, Math.hypot(p.x - x, p.y - y) / reach);
-      a = a + (toPocket - a) * (0.22 + 0.18 * closeness) + sweep;
-      const stepLen = reach / steps;
+      a = a + angleDelta(a, toPocket) * (0.12 + 0.5 * closeness) + sweep;
       x += Math.cos(a) * stepLen;
       y += Math.sin(a) * stepLen;
       if (k === steps) {
         x = p.x;
         y = p.y;
+      } else {
+        const held = holdInsideRock(x, y, coreY, rockRadius, anchor);
+        x = held.x;
+        y = held.y;
       }
       pts.push({ x, y });
     }
 
-    const depthBias = Math.min(0.5, Math.max(0.18, 0.5 - p.depthT * 0.3));
-    const tipEmerge = emerge + span * (0.32 + 0.42 * depthBias + (i % 2) * 0.08);
-    const tipSpan = Math.max(0.16, span * (0.55 + rng() * 0.3));
+    // Near pockets are tapped early; the far ones are still being burrowed
+    // toward past mid-maturity. `depthT` nudges deep pockets a touch later.
+    const tipEmerge =
+      emerge + span * 0.35 + distNorm * 0.3 + p.depthT * 0.06;
+    const tipSpan = Math.max(0.2, 0.28 + distNorm * 0.3);
 
-    const baseW = Math.max(0.34 * scale, 0.5 * scale);
+    // Longer runs carry a slightly thicker trunk — a tendril that crossed
+    // the disc had to be a real root, not a hair.
+    const baseW = (0.5 + 0.35 * distNorm) * scale;
     roots.push({
       points: pts,
       widthStart: baseW,
@@ -660,6 +736,71 @@ function growPocketSeekers(
       span: tipSpan,
     });
   }
+}
+
+/** Shortest signed turn from `from` to `to`, radians. */
+function angleDelta(from: number, to: number): number {
+  let d = to - from;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+
+/**
+ * Closest point on any of `strokes` to `target`, plus the local heading of
+ * the segment it landed on. The heading seeds the tendril so it peels off
+ * its parent root instead of teleporting onto the pocket bearing.
+ */
+function nearestOnStrokes(
+  strokes: TreeStroke[],
+  target: Pt,
+): { pt: Pt; heading: number } | null {
+  let bestDist = Infinity;
+  let best: { pt: Pt; heading: number } | null = null;
+  for (const s of strokes) {
+    const pts = s.points;
+    if (pts.length < 2) continue;
+    for (let k = 0; k < pts.length - 1; k++) {
+      const a = pts[k]!;
+      const b = pts[k + 1]!;
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const len2 = dx * dx + dy * dy;
+      if (len2 < 1e-6) continue;
+      let t = ((target.x - a.x) * dx + (target.y - a.y) * dy) / len2;
+      t = Math.min(1, Math.max(0, t));
+      const cx = a.x + dx * t;
+      const cy = a.y + dy * t;
+      const d = Math.hypot(target.x - cx, target.y - cy);
+      if (d < bestDist) {
+        bestDist = d;
+        best = { pt: { x: cx, y: cy }, heading: Math.atan2(dy, dx) };
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * Pull a burrowing point back inside the rock. The limit never tightens
+ * past where the tendril started, so a tendril anchored high on a root near
+ * the crust is not yanked toward the core on its first step.
+ */
+function holdInsideRock(
+  x: number,
+  y: number,
+  coreY: number,
+  rockRadius: number,
+  anchor: Pt,
+): Pt {
+  const anchorDist = Math.hypot(anchor.x, anchor.y - coreY);
+  const limit = Math.max(rockRadius * SEEK_RIM_LIMIT, anchorDist);
+  const dx = x;
+  const dy = y - coreY;
+  const d = Math.hypot(dx, dy);
+  if (d <= limit || d < 1e-6) return { x, y };
+  const k = limit / d;
+  return { x: dx * k, y: coreY + dy * k };
 }
 
 function growNeuronAxon(
