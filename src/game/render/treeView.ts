@@ -32,7 +32,22 @@ import {
 import { GlowPool, paintGlowEllipse } from './glow';
 import { paintCalyx, paintSeedHull } from './seedlingPaint';
 
-const TREE_REDRAW_INTERVAL = 1 / 15;
+/**
+ * How often the sap animation is repainted. Sap is the only part of a tree
+ * that moves on wall clock, so it is the only thing this paces.
+ */
+const SAP_INTERVAL = 1 / 15;
+
+/**
+ * Per-frame repaint allowance shared by every tree on screen.
+ *
+ * A deadline rather than a count: the two repaints a tree can ask for cost
+ * wildly different amounts on different hardware (~16 ms and ~8 ms for a
+ * mature tree under software GL, a fraction of that on a real GPU), so a
+ * fixed count either starves fast machines or blows the frame on slow ones.
+ * `deadline` is a `performance.now()` stamp; trees repaint until it passes.
+ */
+export type TreeFrameBudget = { deadline: number };
 
 /**
  * Hash of the ids of every sprout still attached to a tree. The value is
@@ -86,9 +101,9 @@ export class TreeView {
   }[] = [];
   private lastHueBucket = -1;
   private lastTheme: ScenePalette['theme'] | undefined;
-  private lastRedrawTime = -Infinity;
   private lastRedrawMaturity = 0;
   private needsRedraw = true;
+  private lastSapTime = 0;
   private lastDepartureSignature = -1;
 
   constructor(tree: Tree, asteroid: Asteroid, scene: ScenePalette) {
@@ -111,7 +126,6 @@ export class TreeView {
     this.layout(tree, asteroid);
     this.redraw(tree, asteroid);
     this.needsRedraw = false;
-    this.lastRedrawTime = performance.now() / 1000;
     this.lastRedrawMaturity = tree.maturity;
   }
 
@@ -129,10 +143,26 @@ export class TreeView {
     this.roots.rotation = this.baseRot;
   }
 
-  update(tree: Tree, asteroid: Asteroid): void {
-    if (tree.id !== this.treeId) return;
+  /**
+   * Advance one tree.
+   *
+   * `budget` is the caller's shared deadline for the whole grove. Both
+   * repaints a tree can ask for are heavy enough that a wide grove must not
+   * run all of them on the same frame:
+   *
+   *   - the canopy/root rebuild, only due when maturity has moved;
+   *   - the sap glow, due on wall clock.
+   *
+   * A tree that is refused simply stays due and is served on a later frame,
+   * so nothing is lost, it just lands a frame or two later.
+   *
+   * Returns true if any budget was spent.
+   */
+  update(tree: Tree, asteroid: Asteroid, budget: TreeFrameBudget): boolean {
+    if (tree.id !== this.treeId) return false;
     this.layout(tree, asteroid);
-    const t = performance.now() / 1000;
+    const nowMs = performance.now();
+    const t = nowMs / 1000;
     const young = 1 - tree.maturity;
     const breeze =
       (Math.sin(t * 0.55 + this.swayPhase) * 0.055 +
@@ -142,20 +172,37 @@ export class TreeView {
     this.canopy.rotation = this.baseRot + breeze;
     this.roots.rotation = this.baseRot;
     this.canopy.scale.set(1 + Math.sin(t * 0.85 + this.swayPhase) * 0.014);
-    // Throttle the geometry rebuild to ~30 Hz and only retrigger if
-    // maturity moved enough that the per-frame interpolation would read
-    // as a jump. The leaf transform above keeps the motion smooth at the
-    // full 60 Hz redraw.
+    // The canopy and root geometry is a pure function of the baked adult
+    // tree, the maturity and the palette — none of which move with `t`. The
+    // sway above is a transform, so it stays smooth at 60 Hz for free.
+    //
+    // This used to rebuild on a timer as well, which meant every tree on
+    // screen re-walked ~140 strokes and ~35 blooms 15 times a second and,
+    // once a grove had grown in, produced byte-identical paths every time.
+    // At ~19 ms per tree that was the single largest cost in the frame, and
+    // it got worse as the frame got slower: below 15 fps the timer was
+    // always expired, so the throttle stopped throttling exactly when it
+    // mattered. Rebuild only when maturity has actually moved.
+    let spent = false;
+    // Both repaints below are heavy path building. Once the grove has spent
+    // the frame's allowance the rest of the trees keep last frame's paint
+    // and are served on a later frame — they stay due, so nothing is lost.
+    const affordable = nowMs < budget.deadline;
     const matureDelta = Math.abs(tree.maturity - this.lastRedrawMaturity);
-    if (
-      this.needsRedraw ||
-      t - this.lastRedrawTime >= TREE_REDRAW_INTERVAL ||
-      matureDelta > 0.004
-    ) {
+    if (this.needsRedraw || (matureDelta > 0.004 && affordable)) {
+      // The very first paint is never refused — a tree with no geometry yet
+      // would otherwise show as nothing at all.
       this.redraw(tree, asteroid, t);
       this.needsRedraw = false;
-      this.lastRedrawTime = t;
       this.lastRedrawMaturity = tree.maturity;
+      this.lastSapTime = t;
+      spent = true;
+    } else if (affordable && t - this.lastSapTime >= SAP_INTERVAL) {
+      // Sap is the one part that animates on wall clock. It paints into its
+      // own Graphics layers, so it can run without touching the geometry.
+      this.paintSap(tree, t);
+      this.lastSapTime = t;
+      spent = true;
     }
 
     const burn =
@@ -165,6 +212,7 @@ export class TreeView {
     const alpha = 1 - burn * 0.65;
     this.canopy.alpha = alpha;
     this.roots.alpha = alpha;
+    return spent;
   }
 
   retheme(tree: Tree, asteroid: Asteroid, scene: ScenePalette): void {

@@ -77,6 +77,7 @@ import { Starfield } from './game/render/starfield';
 import {
   seedlingDepartureSignature,
   TreeView,
+  type TreeFrameBudget,
 } from './game/render/treeView';
 import { tickAi } from './game/sim/ai';
 import {
@@ -140,6 +141,22 @@ const AUTOSAVE_SECONDS = 10;
 
 const ROCK_REPAINTS_PER_FRAME = 2;
 const TREE_REPAINTS_PER_FRAME = 2;
+/**
+ * How long one frame may spend repainting trees.
+ *
+ * A grown grove is the most expensive thing on screen: on the 32-tree
+ * overview save each tree costs ~16 ms to rebuild its canopy and ~8 ms to
+ * repaint its sap under software GL, so an unbudgeted frame spent ~800 ms in
+ * trees alone and the field could never climb back out.
+ *
+ * This is a wall-clock allowance rather than a repaint count so it means the
+ * same thing on a laptop and on a workstation. Trees refused by it keep last
+ * frame's paint and stay due, so work is deferred, never dropped: growth
+ * lands a frame or two late, and the sap glow — a 5.55 s cycle with a
+ * per-plant phase offset — staggers in a way the eye cannot follow, since
+ * the grove never pulsed in lockstep to begin with.
+ */
+const TREE_REPAINT_BUDGET_MS = 4;
 
 /**
  * Backbuffer scale. Soft rocks, washes and gradients are fill-rate bound, so
@@ -1119,6 +1136,15 @@ async function boot(): Promise<void> {
     }
   });
 
+  // Where the repaint budget ran out last frame, so the trees after it get
+  // their turn next time instead of the first few always winning. Without
+  // this, a field too big for one frame's budget would animate its first
+  // few trees and freeze the rest.
+  let treeCursor = 0;
+  // Reused every frame so the per-tree call does not allocate.
+  const treeWork: TreeFrameBudget = { deadline: 0 };
+  const TREE_WORK_NONE: TreeFrameBudget = { deadline: 0 };
+
   app.ticker.add((ticker) => {
     const frameDt = Math.min(0.05, ticker.deltaMS / 1000);
     perf.beginFrame(ticker.deltaMS);
@@ -1343,6 +1369,9 @@ async function boot(): Promise<void> {
 
     perf.start('trees');
     let treeBudget = TREE_REPAINTS_PER_FRAME;
+    treeWork.deadline = performance.now() + TREE_REPAINT_BUDGET_MS;
+    let visibleTrees = 0;
+    let served = 0;
     for (const [id, view] of treeViews) {
       const tree = world.trees.get(id);
       if (!tree) continue;
@@ -1352,13 +1381,30 @@ async function boot(): Promise<void> {
       view.canopy.visible = on;
       view.roots.visible = on;
       if (!on) continue;
-      if (treeBudget > 0 && treeRepaints.delete(id)) {
+      // A retheme is a full geometry repaint, so it comes out of the same
+      // frame allowance as everything else the grove wants to redraw. A tree
+      // that misses out is left in `treeRepaints` and recolours on a later
+      // frame — the check runs before the first repaint, so at least one
+      // always gets through and the queue cannot stall.
+      if (
+        treeBudget > 0 &&
+        performance.now() < treeWork.deadline &&
+        treeRepaints.delete(id)
+      ) {
         treeBudget -= 1;
         view.retheme(tree, asteroid, scene);
       }
-      view.update(tree, asteroid);
+      // Trees ahead of the cursor already had their turn on an earlier frame.
+      const turn = visibleTrees >= treeCursor;
+      visibleTrees += 1;
+      if (view.update(tree, asteroid, turn ? treeWork : TREE_WORK_NONE)) {
+        served += 1;
+      }
       view.setDepartingSeedlings(seedlingsArr, tree, asteroid, departureSig);
     }
+    // Wrap once the cursor has walked past the last visible tree.
+    treeCursor = served > 0 ? treeCursor + served : 0;
+    if (treeCursor >= visibleTrees) treeCursor = 0;
     perf.stop();
 
     perf.start('seedlings');
